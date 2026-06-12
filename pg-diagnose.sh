@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SCRIPT_DIR}/src"
 
-while IFS= read -r m; do
+while IFS= read -r m || [[ -n "$m" ]]; do
   [[ -z "$m" || "$m" == \#* ]] && continue
   if [[ ! -f "${SRC}/${m}" ]]; then
     echo "missing module listed in src/MODULES: ${m}" >&2

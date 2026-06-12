@@ -56,9 +56,7 @@ phase_config() {
   )
   ORDER BY name;
   "
-  echo "   (memory/cost values above feed the spill, cache-fit, and WAL findings —"
-  echo "    pg_stat_statements.track=top means SQL issued inside functions/triggers"
-  echo "    is not recorded separately; track=all records it at extra overhead)"
+  echo "   (these values feed the spill, cache-fit, and WAL findings below; pgss.track semantics: $0 --legend)"
 
   local COMPUTE_QID TRACK_IO TRACK_WAL_IO IO_METHOD TRACK_DELAY
   local -a DO_PARAMS=()

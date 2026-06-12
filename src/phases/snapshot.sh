@@ -86,23 +86,17 @@ phase_snapshot() {
   ORDER BY sort;
   "
 
-  run_section "active queries (no wait)" "
-  SELECT
-    pid,
-    query_id,
-    backend_type,
-    usename,
-    application_name,
-    client_addr,
-    now() - query_start AS duration,
-    left(query, 200) AS query
+  run_list "active queries (no wait)" "none" "
+  SELECT format(E'pid=%s qid=%s %s  %s / %s @ %s  age=%s\n  %s',
+    pid, query_id, backend_type, usename, application_name, client_addr,
+    now() - query_start, left(query, 200))
   FROM pg_stat_activity
   WHERE state = 'active'
     AND wait_event_type IS NULL
     AND pid <> pg_backend_pid()
   ORDER BY query_start
   LIMIT 20;
-  " -x
+  "
 
   run_section "load attribution by app/user/client" "
   SELECT
@@ -248,32 +242,24 @@ BACKEND_SQL
   LIMIT 30;
   " -x
 
-  run_section "idle transactions" "
-  SELECT
-    pid,
-    query_id,
-    now() - xact_start    AS xact_age,
-    now() - state_change  AS idle_for,
-    usename,
-    application_name,
-    client_addr,
-    left(query, 200)      AS last_query
+  run_list "idle transactions" "none" "
+  SELECT format(E'pid=%s qid=%s  xact_age=%s idle_for=%s  %s / %s @ %s\n  %s',
+    pid, query_id, now() - xact_start, now() - state_change,
+    usename, application_name, client_addr, left(query, 200))
   FROM pg_stat_activity
   WHERE state IN ('idle in transaction', 'idle in transaction (aborted)')
   ORDER BY xact_start ASC
   LIMIT 20;
-  " -x
+  "
 
-  run_section "parallel workers" "
-  SELECT
+  run_list "parallel workers" "none" "
+  SELECT format(E'pid=%s leader=%s %s  state=%s wait=%s/%s  age=%s qid=%s\n  %s',
     pid, leader_pid, backend_type, state,
-    wait_event_type, wait_event,
-    now() - query_start AS duration,
-    query_id,
-    left(query, 200) AS query
+    coalesce(wait_event_type, 'CPU'), coalesce(wait_event, '-'),
+    now() - query_start, query_id, left(query, 200))
   FROM pg_stat_activity
   WHERE leader_pid IS NOT NULL
      OR backend_type = 'parallel worker'
   ORDER BY leader_pid NULLS LAST, pid;
-  " -x
+  "
 }

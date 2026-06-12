@@ -19,41 +19,38 @@ phase_indexes() {
     echo "      (zero-scan indexes especially) is weak; do not act on it yet."
   fi
 
-  run_section "all user indexes (complete inventory; evidence: static — use this to reconcile against your ORM schema / spot out-of-band indexes and tables)" "
-  SELECT
-    s.schemaname || '.' || s.relname AS table,
-    s.indexrelname AS index,
-    pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
-    s.idx_scan,
-    i.indisvalid AS valid,
-    pg_get_indexdef(i.indexrelid) AS definition
+  run_list "all user indexes (complete inventory; evidence: static — use this to reconcile against your ORM schema / spot out-of-band indexes and tables)" "none" "
+  SELECT format(E'%s.%s  %s  scans=%s  valid=%s\n  %s',
+    s.schemaname || '.' || s.relname, s.indexrelname,
+    pg_size_pretty(pg_relation_size(s.indexrelid)),
+    s.idx_scan, i.indisvalid, pg_get_indexdef(i.indexrelid))
   FROM pg_stat_user_indexes s
   JOIN pg_index i ON i.indexrelid = s.indexrelid
   WHERE s.schemaname NOT LIKE 'pg\_temp%'
-  ORDER BY 1, pg_relation_size(s.indexrelid) DESC;
-  " -x
+  ORDER BY s.schemaname || '.' || s.relname, pg_relation_size(s.indexrelid) DESC;
+  "
 
-  run_section "unindexed FK columns (child > 10MB or > 100 writes; soft-delete parents annotated)" "
-  SELECT
-    n.nspname || '.' || cl.relname AS child_table,
-    c.conname AS fk_constraint,
+  run_list "unindexed FK columns (child > 10MB or > 100 writes; soft-delete parents annotated)" "none" "
+  SELECT format(E'%s.%s (%s) -> %s  on_delete=%s parent_del=%s child=%s writes=%s%s',
+    n.nspname || '.' || cl.relname,
+    c.conname,
     (SELECT string_agg(a.attname, ', ' ORDER BY x.ord)
        FROM unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord)
-       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum) AS fk_columns,
-    rn.nspname || '.' || rcl.relname AS referenced_table,
+       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum),
+    rn.nspname || '.' || rcl.relname,
     CASE c.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
          WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT'
-         ELSE 'NO ACTION' END AS on_delete,
-    coalesce(pst.n_tup_del, 0) AS parent_deletes,
-    pg_size_pretty(pg_relation_size(c.conrelid)) AS child_size,
-    coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0) AS child_writes,
+         ELSE 'NO ACTION' END,
+    coalesce(pst.n_tup_del, 0),
+    pg_size_pretty(pg_relation_size(c.conrelid)),
+    coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0),
     CASE WHEN EXISTS (
            SELECT 1 FROM pg_attribute pa
            WHERE pa.attrelid = c.confrelid
              AND pa.attname = 'deletedAt'
              AND NOT pa.attisdropped)
-         THEN 'parent soft-deletes — RI benefit unlikely; index only if joined on'
-         ELSE '' END AS note
+         THEN E'\n  parent soft-deletes — RI benefit unlikely; index only if joined on'
+         ELSE '' END)
   FROM pg_constraint c
   JOIN pg_class cl ON cl.oid = c.conrelid
   JOIN pg_namespace n ON n.oid = cl.relnamespace
@@ -77,7 +74,7 @@ phase_indexes() {
     )
   ORDER BY coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0) DESC,
            pg_relation_size(c.conrelid) DESC;
-  " -x
+  "
 
   local HIDDEN_FK
   HIDDEN_FK="$(psql_get "
@@ -102,16 +99,12 @@ phase_indexes() {
     echo "   (+${HIDDEN_FK} unindexed FK(s) on small/cold child tables hidden — below 10MB and 100 writes)"
   fi
 
-  run_section "redundant indexes (prefix-covered or equal to a unique index; verify both definitions before DROP; scans of the redundant index shift to the covering one after DROP)" "
-  SELECT
-    n.nspname || '.' || t.relname AS table,
-    ci1.relname AS redundant_index,
-    pg_size_pretty(pg_relation_size(i1.indexrelid)) AS redundant_size,
-    coalesce(ui1.idx_scan, 0) AS redundant_scans,
-    ci2.relname AS covering_index,
-    pg_size_pretty(pg_relation_size(i2.indexrelid)) AS covering_size,
-    pg_get_indexdef(i1.indexrelid) AS redundant_def,
-    pg_get_indexdef(i2.indexrelid) AS covering_def
+  run_list "redundant indexes (prefix-covered or equal to a unique index; verify both definitions before DROP; scans of the redundant index shift to the covering one after DROP)" "none" "
+  SELECT format(E'%s  redundant=%s (%s, scans=%s) covered by %s (%s)\n  redundant: %s\n  covering:  %s',
+    n.nspname || '.' || t.relname,
+    ci1.relname, pg_size_pretty(pg_relation_size(i1.indexrelid)), coalesce(ui1.idx_scan, 0),
+    ci2.relname, pg_size_pretty(pg_relation_size(i2.indexrelid)),
+    pg_get_indexdef(i1.indexrelid), pg_get_indexdef(i2.indexrelid))
   FROM pg_index i1
   JOIN pg_index i2 ON i1.indrelid = i2.indrelid AND i1.indexrelid <> i2.indexrelid
   JOIN pg_class ci1 ON ci1.oid = i1.indexrelid
@@ -143,17 +136,16 @@ phase_indexes() {
          OR EXISTS (SELECT 1 FROM pg_constraint cc2 WHERE cc2.conindid = i2.indexrelid)
          OR i1.indexrelid > i2.indexrelid)
   ORDER BY pg_relation_size(i1.indexrelid) DESC;
-  " -x
+  "
 
-  run_section "zero-scan indexes (evidence: lifetime — see stats-window caveat above)" "
-  SELECT
-    s.schemaname || '.' || s.relname AS table,
-    s.indexrelname AS index,
-    pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
-    pg_get_indexdef(i.indexrelid) AS definition,
+  run_list "zero-scan indexes (evidence: lifetime — see stats-window caveat above)" "none" "
+  SELECT format(E'%s.%s  %s  since=%s\n  %s',
+    s.schemaname || '.' || s.relname, s.indexrelname,
+    pg_size_pretty(pg_relation_size(s.indexrelid)),
     coalesce(
       (SELECT sd.stats_reset FROM pg_stat_database sd WHERE sd.datname = current_database()),
-      (SELECT min(io.stats_reset) FROM pg_stat_io io))::date::text AS stats_since
+      (SELECT min(io.stats_reset) FROM pg_stat_io io))::date::text,
+    pg_get_indexdef(i.indexrelid))
   FROM pg_stat_user_indexes s
   JOIN pg_index i ON i.indexrelid = s.indexrelid
   WHERE s.idx_scan = 0
@@ -166,7 +158,7 @@ phase_indexes() {
     AND NOT EXISTS (SELECT 1 FROM pg_constraint cc WHERE cc.conindid = i.indexrelid)
   ORDER BY pg_relation_size(s.indexrelid) DESC
   LIMIT 30;
-  " -x
+  "
 
   if [[ "$HAS_PGSS" != "t" ]]; then
     echo
@@ -176,15 +168,7 @@ phase_indexes() {
 
   echo
   echo "── plan-driven index candidates ──"
-  echo "   (EXPLAIN GENERIC_PLAN on top pg_stat_statements queries; statements the"
-  echo "    generic planner rejects are retried with typed literals rewritten to"
-  echo "    casts — interval \$1 → \$1::interval — and then with parameters replaced"
-  echo "    by NULL; null-params plans have meaningless est_rows)"
-  echo "   Seq Scan + Filter            → index candidate on filter columns"
-  echo "   Index/Bitmap scan + Filter   → rows fetched by index then discarded → extend index or partial predicate"
-  echo "   large Sort                   → index providing order, or work_mem"
-  echo "   (generic plans use default selectivity for parameters — est_rows are crude;"
-  echo "    statements with no plan at all are listed with the planner's error)"
+  echo "   (plan shapes and generic-plan caveats: $0 --legend)"
 
   set +e
   psql_run_tolerant <<IDX_SQL

@@ -1,9 +1,17 @@
 lib/common.sh
 lib/args.sh
 lib/detect.sh
+lib/plansql.sh
 helpers/banner.sh
 helpers/explain.sh
 helpers/deep.sh
+helpers/sugg/setup.sh
+helpers/sugg/catalog.sh
+helpers/sugg/collect.sh
+helpers/sugg/rules_plan.sh
+helpers/sugg/rules_catalog.sh
+helpers/sugg/rules_cleanup.sh
+helpers/sugg/output.sh
 helpers/suggestions.sh
 phases/config.sh
 phases/snapshot.sh

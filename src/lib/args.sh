@@ -34,6 +34,8 @@ usage:
                                             findings (works with --mode=prisma too)
   ./pg-diagnose.sh --explain-queryid=ID     print stored statement text for one queryid
   ./pg-diagnose.sh --deep-queryid=ID        per-query evidence for index/query design
+  ./pg-diagnose.sh --legend                 print evidence classes, suggestion tiers,
+                                            and methodology notes (no DB connection)
   ./pg-diagnose.sh --output-dir=DIR         write a log of the run (off by default;
                                             logs contain query text, usernames, and
                                             client addresses — last 5 logs kept)
@@ -59,6 +61,7 @@ parse_args() {
   for arg in "$@"; do
     case "$arg" in
       --help|-h) usage 0 ;;
+      --legend) print_legend; exit 0 ;;
       --only=*) ONLY="${arg#--only=}" ;;
       --output-dir=*) OUTPUT_DIR="${arg#--output-dir=}" ;;
       --explain-queryid=*) EXPLAIN_QUERYID="${arg#--explain-queryid=}" ;;

@@ -6,15 +6,7 @@ phase_window() {
   echo "║   Diagnostic window: ${SAMPLE_SECONDS}s (evidence: sampled — strongest)"
   echo "║   before-snapshots → 1Hz wait sampler → counter deltas"
   echo "╚═══════════════════════════════════════════════════════"
-  echo "   (sampler: temp procedure committing per tick — no long-held snapshot;"
-  echo "    idle main-loop waits — wait_event_type=Activity — are excluded)"
-  echo "   (backend_samples counts per-backend: parallel workers multiply wall time,"
-  echo "    so percentages are shares of backend-samples, not wall-clock time)"
-  echo "   (rates are divided by actual elapsed time, not the nominal window length)"
-  echo "   (samples cover the whole cluster — all databases; pg_stat_statements"
-  echo "    deltas below cover only the current database)"
-  echo "   (pgss entries evicted AND recreated mid-window report lifetime totals as in-window)"
-  echo "   (SQL errors in this phase are tolerated and printed inline)"
+  echo "   (sampling methodology and caveats: $0 --legend)"
   echo
   echo "   collecting for ${SAMPLE_SECONDS}s — output appears when the window completes..."
 

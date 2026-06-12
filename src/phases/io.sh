@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 phase_io() {
-  run_section "I/O by backend type (evidence: lifetime, cluster-wide; physical reads/writes — disk vs OS page cache indistinguishable; with io_method=worker, shared-buffer reads are attributed to 'io worker')" "
+  run_section "I/O by backend type (evidence: lifetime, cluster-wide)" "
   SELECT
     backend_type,
     object,
