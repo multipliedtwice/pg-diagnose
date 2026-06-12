@@ -24,7 +24,9 @@ explain_queryid_helper() {
   FROM pg_stat_statements s
   JOIN pg_database d ON d.oid = s.dbid
   WHERE d.datname = current_database()
-    AND s.queryid = ${EXPLAIN_QUERYID};
+    AND s.queryid = ${EXPLAIN_QUERYID}
+    AND s.toplevel
+  ORDER BY s.calls DESC;
   "
 
   echo

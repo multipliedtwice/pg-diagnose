@@ -42,6 +42,7 @@ usage:
   ./pg-diagnose.sh --help                   this text
 
 --mode, --explain-queryid, and --deep-queryid are mutually exclusive.
+--include-cleanup, --show-low-confidence-sql, and --debug require --mode.
 The script only reads statistics. It never executes suggested SQL or modifies data.
 USAGE
 }
@@ -78,6 +79,13 @@ parse_args() {
   fi
   if [[ "$MODE" == "prisma" ]]; then
     PRISMA_OUT=1
+  fi
+
+  if [[ -z "$MODE" ]]; then
+    if [[ "$INCLUDE_CLEANUP" == "1" || "$SHOW_LOW_SQL" == "1" || "$DEBUG" == "1" ]]; then
+      echo "--include-cleanup, --show-low-confidence-sql, and --debug require --mode=suggestions or --mode=prisma" >&2
+      usage
+    fi
   fi
 
   local exclusive=0

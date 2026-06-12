@@ -107,4 +107,10 @@ phase_config() {
     echo "   Applies on reload (no restart). Stats accumulate forward only —"
     echo "   re-run this script after load has run for a while."
   fi
+
+  run_list "installed extensions (versions gate some advice, e.g. pgvector >= 0.8 enables hnsw.iterative_scan)" "(none)" "
+  SELECT '    ' || extname || ' ' || extversion
+  FROM pg_extension
+  ORDER BY extname;
+  "
 }

@@ -19,6 +19,20 @@ phase_indexes() {
     echo "      (zero-scan indexes especially) is weak; do not act on it yet."
   fi
 
+  run_section "all user indexes (complete inventory; evidence: static — use this to reconcile against your ORM schema / spot out-of-band indexes)" "
+  SELECT
+    s.schemaname || '.' || s.relname AS table,
+    s.indexrelname AS index,
+    pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+    s.idx_scan,
+    i.indisvalid AS valid,
+    pg_get_indexdef(i.indexrelid) AS definition
+  FROM pg_stat_user_indexes s
+  JOIN pg_index i ON i.indexrelid = s.indexrelid
+  WHERE s.schemaname NOT LIKE 'pg\_temp%'
+  ORDER BY 1, pg_relation_size(s.indexrelid) DESC;
+  " -x
+
   run_section "unindexed FK columns (child > 10MB or > 100 writes; soft-delete parents annotated)" "
   SELECT
     n.nspname || '.' || cl.relname AS child_table,

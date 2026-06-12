@@ -9,8 +9,10 @@ phase_triggers() {
     echo "   (track_functions=none — per-function timing below will be empty;"
     echo "    see the config phase for how to enable it)"
   fi
+  echo "   (check each definition for its event list and WHEN clause — a trigger"
+  echo "    firing on every UPDATE of a hot table is a hidden CPU source)"
 
-  run_section "triggers by table write volume (every write fires these)" "
+  run_section "triggers by table write volume (every matching write fires these)" "
   SELECT
     n.nspname || '.' || c.relname AS table,
     t.tgname AS trigger,
@@ -19,7 +21,8 @@ phase_triggers() {
     coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0) AS table_writes,
     f.calls AS fn_calls,
     f.total_time::int AS fn_total_ms,
-    round((f.self_time / NULLIF(f.calls, 0))::numeric, 2) AS fn_mean_ms
+    round((f.self_time / NULLIF(f.calls, 0))::numeric, 2) AS fn_mean_ms,
+    pg_get_triggerdef(t.oid) AS definition
   FROM pg_trigger t
   JOIN pg_class c ON c.oid = t.tgrelid
   JOIN pg_namespace n ON n.oid = c.relnamespace

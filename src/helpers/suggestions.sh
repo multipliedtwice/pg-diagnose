@@ -40,8 +40,8 @@ suggestions_mode() {
   echo "   (active, enabled triggers are never judged droppable from statistics —"
   echo "    only disabled, duplicate, and never-firing triggers are flagged)"
   echo "   (coverage limit: this mode only detects specific plan shapes —"
-  echo "    GIN-able filters, sorted pagination, disk spills — plus catalog facts:"
-  echo "    stale statistics, dead tuples, unindexed foreign keys."
+  echo "    GIN-able filters, vector-distance sorts, sorted pagination, disk spills —"
+  echo "    plus catalog facts: stale statistics, dead tuples, unindexed foreign keys."
   echo "    A plain missing btree index (WHERE col = \$1 running as a Seq Scan)"
   echo "    is NOT auto-suggested: generic plans make it false-positive-prone."
   echo "    For those, start from the full run's 'heavy seq scans' section and"
@@ -55,6 +55,8 @@ suggestions_mode() {
     echo "       prisma migrate dev stays in sync before adopting)"
     echo "     - Prisma cannot create indexes CONCURRENTLY — the raw SQL stays"
     echo "       attached to each index suggestion for large live tables"
+    echo "     - ANN indexes (hnsw/ivfflat) are not expressible in Prisma schema —"
+    echo "       they stay raw SQL (deliver via an edited migration file)"
     echo "     - ANALYZE/VACUUM suggestions stay SQL (they are not schema changes)"
   fi
   echo "   (if any SQL error occurs, all suggestions from the run are suppressed —"
@@ -111,6 +113,9 @@ BEGIN
   END IF;
   IF stmt ~* '^\s*DROP\s+INDEX' THEN
     RETURN '// remove the matching @@index / @unique attribute from the model, then run: ' || trim(stmt);
+  END IF;
+  IF stmt ~* 'USING\s+(hnsw|ivfflat)' THEN
+    RETURN '// ANN index — not expressible in Prisma schema; keep as raw SQL (edited migration file): ' || trim(stmt);
   END IF;
   m := regexp_match(stmt,
     '^\s*CREATE\s+INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\s+"?([A-Za-z0-9_]+)"?\s+ON\s+(?:"?[A-Za-z0-9_]+"?\.)?"?([A-Za-z0-9_]+)"?\s+(USING\s+gin\s+)?\(([^)]*)\)\s*(?:WHERE\s+(.+))?;\s*\$',
@@ -207,6 +212,100 @@ SELECT
   count(*) AS top_stmts_checked,
   count(*) FILTER (WHERE plan IS NULL) AS skipped_unplannable
 FROM sg_plans;
+
+INSERT INTO sugg
+SELECT
+  'HIGH', 'HIGH',
+  'Missing ANN index (vector distance sort)',
+  x.top_queryid,
+  x.schemaname || '.' || x.relname,
+  'CREATE INDEX CONCURRENTLY IF NOT EXISTS '
+    || quote_ident(pg_temp.idx_name(x.relname || '_' || x.colname || '_hnsw_idx'))
+    || ' ON ' || quote_ident(x.schemaname) || '.' || quote_ident(x.relname)
+    || ' USING hnsw (' || quote_ident(x.colname) || ' ' || o.opclass || ');',
+  'ORDER BY a vector distance over ' || x.colname || ' computes the distance for every candidate row and sorts the full set on every call. An HNSW index serves ORDER BY '
+    || quote_ident(x.colname) || ' ' || x.op
+    || ' <param> LIMIT n directly. Results become APPROXIMATE (recall vs speed: hnsw.ef_search). The index is used ONLY when the ORDER BY expression is the bare ascending distance — rewrite forms like (constant - (col '
+    || x.op || ' v)) DESC to the bare distance and derive similarity in the select list. A partial index (e.g. WHERE "deletedAt" IS NULL AND '
+    || quote_ident(x.colname) || ' IS NOT NULL) is smaller, but every query must repeat the predicate verbatim.',
+  'queries=' || x.queries || ' queryids=[' || x.queryids || ']'
+    || ' combined_total_ms=' || x.total_ms
+    || ' pgvector=' || coalesce((SELECT extversion FROM pg_extension WHERE extname = 'vector'), 'not installed')
+    || ' sort_expr: ' || left(x.expr, 160),
+  '$0 --deep-queryid=' || x.top_queryid,
+  'Approximate results; combined with selective filters it can return fewer than LIMIT rows (pgvector >= 0.8: hnsw.iterative_scan). The build is memory/time heavy (maintenance_work_mem) and every write to ' || x.colname || ' updates the graph.',
+  'The workload aggregates over all matching rows, exact ordering is required, or the ORDER BY cannot be rewritten to the bare distance expression.',
+  8
+FROM (
+  SELECT z.schemaname, z.relname, z.colname, z.op,
+    count(*) AS queries,
+    sum(z.total_exec_time)::bigint AS total_ms,
+    (array_agg(z.queryid ORDER BY z.total_exec_time DESC))[1] AS top_queryid,
+    string_agg(z.queryid::text, ', ' ORDER BY z.total_exec_time DESC) AS queryids,
+    max(z.expr) AS expr
+  FROM (
+    SELECT DISTINCT ON (y.schemaname, y.relname, y.colname, y.op, y.queryid)
+      y.schemaname, y.relname, y.colname, y.op, y.queryid, y.total_exec_time, y.expr
+    FROM (
+      WITH lim AS (
+        SELECT DISTINCT queryid FROM sg_nodes WHERE node ->> 'Node Type' = 'Limit'
+      ),
+      dsorts AS (
+        SELECT n.queryid, n.total_exec_time, n.node -> 'Sort Key' ->> 0 AS sk0
+        FROM sg_nodes n
+        JOIN lim USING (queryid)
+        WHERE n.node ->> 'Node Type' IN ('Sort', 'Incremental Sort')
+          AND n.node -> 'Sort Key' ->> 0 ~ '(<->|<=>|<#>|<\+>)'
+      ),
+      rels AS (
+        SELECT DISTINCT n.queryid,
+          coalesce(n.node ->> 'Schema', 'public') AS schemaname,
+          n.node ->> 'Relation Name' AS relname,
+          coalesce(n.node ->> 'Alias', n.node ->> 'Relation Name') AS als
+        FROM sg_nodes n
+        WHERE n.node ? 'Relation Name'
+      )
+      SELECT d.queryid, d.total_exec_time, r.schemaname, r.relname, d.sk0 AS expr,
+        k.m[1] AS colname, k.m[2] AS op
+      FROM dsorts d
+      JOIN rels r USING (queryid)
+      CROSS JOIN LATERAL (
+        SELECT coalesce(
+          regexp_match(d.sk0,
+            '(?:\m' || r.als || '\.|"' || r.als || '"\.)"?([A-Za-z_][A-Za-z0-9_]*)"?[[:space:]]*(<->|<=>|<#>|<\+>)'),
+          CASE WHEN d.sk0 !~ '\.' THEN regexp_match(d.sk0,
+            '(?<![."A-Za-z0-9_])"?([A-Za-z_][A-Za-z0-9_]*)"?[[:space:]]*(<->|<=>|<#>|<\+>)') END
+        ) AS m
+      ) k
+      WHERE k.m IS NOT NULL
+    ) y
+    ORDER BY y.schemaname, y.relname, y.colname, y.op, y.queryid
+  ) z
+  GROUP BY z.schemaname, z.relname, z.colname, z.op
+) x
+JOIN pg_namespace ns3 ON ns3.nspname = x.schemaname
+JOIN pg_class c3 ON c3.relnamespace = ns3.oid AND c3.relname = x.relname
+JOIN pg_attribute a7 ON a7.attrelid = c3.oid AND a7.attname = x.colname AND NOT a7.attisdropped
+JOIN pg_type ty2 ON ty2.oid = a7.atttypid AND ty2.typname IN ('vector', 'halfvec', 'sparsevec')
+CROSS JOIN LATERAL (
+  SELECT ty2.typname || CASE x.op
+    WHEN '<->' THEN '_l2_ops'
+    WHEN '<=>' THEN '_cosine_ops'
+    WHEN '<#>' THEN '_ip_ops'
+    ELSE '_l1_ops'
+  END AS opclass
+) o
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM pg_index i
+  JOIN pg_class ic ON ic.oid = i.indexrelid
+  JOIN pg_am am ON am.oid = ic.relam AND am.amname IN ('hnsw', 'ivfflat')
+  JOIN pg_opclass oc ON oc.oid = (i.indclass::oid[])[0]
+  WHERE i.indrelid = c3.oid
+    AND i.indisvalid
+    AND (i.indkey::smallint[])[0] = a7.attnum
+    AND oc.opcname = o.opclass
+);
 
 INSERT INTO sugg
 SELECT

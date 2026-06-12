@@ -36,7 +36,7 @@ phase_tables() {
     pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
     CASE WHEN (total_analyze_time + total_autoanalyze_time)
             / NULLIF(analyze_count + autoanalyze_count, 0) > 60000
-         THEN '⚠ expensive ANALYZE (>60s avg) — check per-column statistics targets / extended stats / wide TOAST'
+         THEN '⚠ expensive ANALYZE (>60s avg) — see ANALYZE cost attribution below'
          ELSE '' END AS note
   FROM pg_stat_user_tables
   WHERE schemaname NOT LIKE 'pg\_temp%'
@@ -44,6 +44,34 @@ phase_tables() {
       + total_analyze_time + total_autoanalyze_time > 0
   ORDER BY total_vacuum_time + total_autovacuum_time DESC
   LIMIT 15;
+  "
+
+  run_section "ANALYZE cost attribution — columns of tables with avg ANALYZE > 60s (sampling detoasts every wide column; SET STATISTICS 0 skips a column entirely)" "
+  SELECT
+    x.table,
+    a.attname AS column,
+    format_type(a.atttypid, a.atttypmod) AS type,
+    coalesce(a.attstattarget::text, 'default') AS stats_target,
+    st.avg_width,
+    st.n_distinct,
+    CASE WHEN ty.typname IN ('vector', 'halfvec', 'sparsevec')
+         THEN 'planner gains nothing from stats on vector types — SET STATISTICS 0 candidate'
+         WHEN coalesce(st.avg_width, 0) > 1000
+         THEN 'wide column — detoasted for every sampled row; lower target if never filtered on'
+         ELSE '' END AS note
+  FROM (
+    SELECT s.relid, s.schemaname, s.relname,
+           s.schemaname || '.' || s.relname AS table
+    FROM pg_stat_user_tables s
+    WHERE (s.total_analyze_time + s.total_autoanalyze_time)
+        / NULLIF(s.analyze_count + s.autoanalyze_count, 0) > 60000
+  ) x
+  JOIN pg_attribute a ON a.attrelid = x.relid AND a.attnum > 0 AND NOT a.attisdropped
+  JOIN pg_type ty ON ty.oid = a.atttypid
+  LEFT JOIN pg_stats st ON st.schemaname = x.schemaname
+                       AND st.tablename = x.relname
+                       AND st.attname = a.attname
+  ORDER BY x.table, coalesce(st.avg_width, 0) DESC, a.attnum;
   "
 
   run_section "transaction ID age / freeze risk (high xid_age forces aggressive anti-wraparound autovacuum — a hidden CPU source)" "

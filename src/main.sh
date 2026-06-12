@@ -73,8 +73,10 @@ run_cli() {
     LOG_FILE="${OUTPUT_DIR}/diag-$(date +%Y%m%d-%H%M%S).txt"
     local rc=0
     set +e
+    set -o pipefail
     main 2>&1 | tee "$LOG_FILE"
     rc=$?
+    set +o pipefail
     set -e
     echo
     echo "log written: ${LOG_FILE}"
