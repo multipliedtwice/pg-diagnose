@@ -41,6 +41,10 @@ phase_indexes() {
        FROM unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord)
        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum) AS fk_columns,
     rn.nspname || '.' || rcl.relname AS referenced_table,
+    CASE c.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
+         WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT'
+         ELSE 'NO ACTION' END AS on_delete,
+    coalesce(pst.n_tup_del, 0) AS parent_deletes,
     pg_size_pretty(pg_relation_size(c.conrelid)) AS child_size,
     coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0) AS child_writes,
     CASE WHEN EXISTS (
@@ -56,6 +60,7 @@ phase_indexes() {
   JOIN pg_class rcl ON rcl.oid = c.confrelid
   JOIN pg_namespace rn ON rn.oid = rcl.relnamespace
   LEFT JOIN pg_stat_user_tables st ON st.relid = c.conrelid
+  LEFT JOIN pg_stat_user_tables pst ON pst.relid = c.confrelid
   WHERE c.contype = 'f'
     AND (pg_relation_size(c.conrelid) > 10 * 1024 * 1024
          OR coalesce(st.n_tup_ins + st.n_tup_upd + st.n_tup_del, 0) > 100)
@@ -97,12 +102,14 @@ phase_indexes() {
     echo "   (+${HIDDEN_FK} unindexed FK(s) on small/cold child tables hidden — below 10MB and 100 writes)"
   fi
 
-  run_section "redundant indexes (prefix-covered; verify both definitions before DROP)" "
+  run_section "redundant indexes (prefix-covered; verify both definitions before DROP; scans of the redundant index shift to the covering one after DROP)" "
   SELECT
     n.nspname || '.' || t.relname AS table,
     ci1.relname AS redundant_index,
     pg_size_pretty(pg_relation_size(i1.indexrelid)) AS redundant_size,
+    coalesce(ui1.idx_scan, 0) AS redundant_scans,
     ci2.relname AS covering_index,
+    pg_size_pretty(pg_relation_size(i2.indexrelid)) AS covering_size,
     pg_get_indexdef(i1.indexrelid) AS redundant_def,
     pg_get_indexdef(i2.indexrelid) AS covering_def
   FROM pg_index i1
@@ -111,6 +118,7 @@ phase_indexes() {
   JOIN pg_class ci2 ON ci2.oid = i2.indexrelid
   JOIN pg_class t ON t.oid = i1.indrelid
   JOIN pg_namespace n ON n.oid = t.relnamespace
+  LEFT JOIN pg_stat_user_indexes ui1 ON ui1.indexrelid = i1.indexrelid
   WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
     AND i1.indpred IS NULL AND i2.indpred IS NULL
     AND i1.indexprs IS NULL AND i2.indexprs IS NULL
@@ -166,58 +174,103 @@ phase_indexes() {
 
   echo
   echo "── plan-driven index candidates ──"
-  echo "   (EXPLAIN GENERIC_PLAN on top pg_stat_statements queries)"
+  echo "   (EXPLAIN GENERIC_PLAN on top pg_stat_statements queries; statements the"
+  echo "    generic planner rejects are retried with parameters replaced by NULL —"
+  echo "    those plans are marked null-params and their est_rows are meaningless)"
   echo "   Seq Scan + Filter            → index candidate on filter columns"
   echo "   Index/Bitmap scan + Filter   → rows fetched by index then discarded → extend index or partial predicate"
   echo "   large Sort                   → index providing order, or work_mem"
   echo "   (generic plans use default selectivity for parameters — est_rows are crude;"
-  echo "    unplannable statements are skipped silently — see coverage line below)"
+  echo "    statements with no plan at all are listed with the planner's error)"
 
   set +e
   psql_run_tolerant <<IDX_SQL
-SET statement_timeout = '120s';
+SET statement_timeout = '180s';
 SET lock_timeout = '2s';
 
-CREATE FUNCTION pg_temp.explain_generic(q text) RETURNS jsonb
+CREATE FUNCTION pg_temp.explain_try(q text, OUT plan jsonb, OUT planmode text, OUT err text)
 LANGUAGE plpgsql AS \$fn\$
 DECLARE r json;
 BEGIN
-  EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) ' || q INTO r;
-  RETURN r::jsonb;
-EXCEPTION WHEN OTHERS THEN
-  RETURN NULL;
+  BEGIN
+    EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) ' || q INTO r;
+    plan := r::jsonb;
+    planmode := 'generic';
+    RETURN;
+  EXCEPTION WHEN OTHERS THEN
+    err := SQLERRM;
+  END;
+  BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) '
+      || regexp_replace(q, '[\$][0-9]+', 'NULL', 'g') INTO r;
+    plan := r::jsonb;
+    planmode := 'null-params';
+    RETURN;
+  EXCEPTION WHEN OTHERS THEN
+    err := err || ' || null-params: ' || SQLERRM;
+    planmode := 'failed';
+  END;
 END
 \$fn\$;
 
-CREATE TEMP TABLE ix_top AS
-SELECT s.queryid, s.calls, s.total_exec_time, s.mean_exec_time, s.query
+CREATE TEMP TABLE ix_base AS
+SELECT s.queryid, s.calls, s.total_exec_time, s.mean_exec_time, s.temp_blks_written, s.query
 FROM pg_stat_statements s
 JOIN pg_database d ON d.oid = s.dbid AND d.datname = current_database()
 WHERE s.calls > 5
   AND s.query ~* '^[[:space:]]*(select|with|update|delete|insert)'
-  AND ${PGSS_FILTER}
-ORDER BY s.total_exec_time DESC
-LIMIT 15;
+  AND ${PGSS_FILTER};
+
+CREATE TEMP TABLE ix_top AS
+SELECT DISTINCT ON (queryid)
+  queryid, calls, total_exec_time, mean_exec_time, query
+FROM (
+  (SELECT * FROM ix_base ORDER BY total_exec_time DESC LIMIT 15)
+  UNION ALL
+  (SELECT * FROM ix_base WHERE mean_exec_time > 50 ORDER BY mean_exec_time DESC LIMIT 15)
+  UNION ALL
+  (SELECT * FROM ix_base WHERE temp_blks_written > 1000 ORDER BY temp_blks_written DESC LIMIT 10)
+) u
+ORDER BY queryid;
 
 CREATE TEMP TABLE ix_plans AS
 SELECT t.queryid, t.calls, t.total_exec_time, t.mean_exec_time, t.query,
-       pg_temp.explain_generic(t.query) AS plan
-FROM ix_top t;
+       e.plan, e.planmode, e.err
+FROM ix_top t
+CROSS JOIN LATERAL pg_temp.explain_try(t.query) e;
 
 \echo
-\echo '── generic-plan coverage ──'
+\echo '── plan coverage ──'
 SELECT
-  count(*) AS top_stmts_checked,
-  count(*) FILTER (WHERE plan IS NULL) AS skipped_unplannable
+  count(*) AS stmts_checked,
+  count(*) FILTER (WHERE planmode = 'generic') AS generic_plans,
+  count(*) FILTER (WHERE planmode = 'null-params') AS null_param_fallbacks,
+  count(*) FILTER (WHERE plan IS NULL) AS unplannable
 FROM ix_plans;
 
+\echo
+\echo '── statements planned via fallback or excluded from candidates ──'
+SELECT
+  queryid,
+  planmode,
+  left(err, 160) AS planner_error,
+  CASE WHEN plan IS NULL AND query ~ '(<->|<=>|<#>|<\+>)'
+       THEN 'vector distance operator in text — review manually'
+       WHEN plan IS NULL AND query ~ '(@>|&&|<@)'
+       THEN 'container operator in text — review manually'
+       ELSE '' END AS note,
+  left(query, 140) AS query
+FROM ix_plans
+WHERE planmode <> 'generic'
+ORDER BY total_exec_time DESC;
+
 CREATE TEMP TABLE ix_nodes AS
-WITH RECURSIVE nodes (queryid, calls, mean_exec_time, query, node) AS (
-  SELECT p.queryid, p.calls, p.mean_exec_time, p.query, p.plan -> 0 -> 'Plan'
+WITH RECURSIVE nodes (queryid, calls, mean_exec_time, planmode, query, node) AS (
+  SELECT p.queryid, p.calls, p.mean_exec_time, p.planmode, p.query, p.plan -> 0 -> 'Plan'
   FROM ix_plans p
   WHERE p.plan IS NOT NULL
   UNION ALL
-  SELECT n.queryid, n.calls, n.mean_exec_time, n.query, child.value
+  SELECT n.queryid, n.calls, n.mean_exec_time, n.planmode, n.query, child.value
   FROM nodes n
   CROSS JOIN LATERAL jsonb_array_elements(n.node -> 'Plans') AS child
   WHERE jsonb_typeof(n.node -> 'Plans') = 'array'
@@ -231,6 +284,7 @@ SELECT
   queryid,
   calls,
   mean_exec_time::int AS mean_ms,
+  planmode,
   node ->> 'Node Type' AS node_type,
   node ->> 'Relation Name' AS relation,
   node ->> 'Index Name' AS index_name,

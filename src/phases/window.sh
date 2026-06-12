@@ -6,8 +6,8 @@ phase_window() {
   echo "║   Diagnostic window: ${SAMPLE_SECONDS}s (evidence: sampled — strongest)"
   echo "║   before-snapshots → 1Hz wait sampler → counter deltas"
   echo "╚═══════════════════════════════════════════════════════"
-  echo "   (sampler: plpgsql loop with pg_stat_clear_snapshot per tick; idle"
-  echo "    main-loop waits — wait_event_type=Activity — are excluded from sampling)"
+  echo "   (sampler: temp procedure committing per tick — no long-held snapshot;"
+  echo "    idle main-loop waits — wait_event_type=Activity — are excluded)"
   echo "   (backend_samples counts per-backend: parallel workers multiply wall time,"
   echo "    so percentages are shares of backend-samples, not wall-clock time)"
   echo "   (rates are divided by actual elapsed time, not the nominal window length)"
@@ -90,10 +90,10 @@ CREATE TEMP TABLE diag_samples (
   query text
 );
 
-/* pg-diagnose */
-DO \$\$
+CREATE PROCEDURE pg_temp.diag_sampler(ticks int)
+LANGUAGE plpgsql AS \$\$
 BEGIN
-  FOR i IN 1..${SAMPLE_SECONDS} LOOP
+  FOR i IN 1..ticks LOOP
     INSERT INTO diag_samples
     SELECT
       a.pid,
@@ -112,11 +112,15 @@ BEGIN
     WHERE a.pid <> pg_backend_pid()
       AND a.state = 'active'
       AND coalesce(a.wait_event_type, '') <> 'Activity';
+    COMMIT;
     PERFORM pg_stat_clear_snapshot();
     PERFORM pg_sleep(1);
   END LOOP;
 END
 \$\$;
+
+/* pg-diagnose */
+CALL pg_temp.diag_sampler(${SAMPLE_SECONDS});
 
 \echo
 \echo '── stats reset check ──'
@@ -208,7 +212,11 @@ SELECT
   a.wal_fpi - b.wal_fpi AS wal_fpi_delta,
   pg_size_pretty((a.wal_bytes - b.wal_bytes)::bigint) AS wal_delta,
   pg_size_pretty(((a.wal_bytes - b.wal_bytes) / e.secs)::bigint) || '/s' AS wal_rate,
-  a.wal_buffers_full - b.wal_buffers_full AS wal_buffers_full_delta
+  a.wal_buffers_full - b.wal_buffers_full AS wal_buffers_full_delta,
+  CASE WHEN a.wal_buffers_full - b.wal_buffers_full
+            > 0.5 * greatest(a.wal_records - b.wal_records, 1)
+       THEN '⚠ wal_buffers_full ≈ wal_records — WAL buffers saturating; see pg_stat_io wal rows'
+       ELSE '' END AS note
 FROM pg_stat_wal a
 CROSS JOIN diag_wal_before b
 CROSS JOIN LATERAL (
@@ -444,6 +452,12 @@ FROM (
   FROM top_sampled t
 ) v
 ORDER BY ord;
+
+SELECT '  ⚠ low sample count (' || count(*) || ' backend-sample(s) total) — the sampled'
+  || E' verdict above is weak;\n    prefer the exec-time line below, or re-run with'
+  || ' SAMPLE_SECONDS=120+ while the load is occurring'
+FROM diag_samples
+HAVING count(*) > 0 AND count(*) < 10;
 
 \if :has_pgss
 SELECT

@@ -22,7 +22,7 @@ phase_config() {
   fi
 
   run_list "critical config values" "(none readable)" "
-  SELECT '    ' || name || ' = ' || setting
+  SELECT '    ' || name || ' = ' || current_setting(name)
   FROM pg_settings
   WHERE name IN (
     'compute_query_id',
@@ -35,10 +35,30 @@ phase_config() {
     'io_workers',
     'pg_stat_statements.track',
     'pg_stat_statements.track_planning',
-    'pg_stat_statements.max'
+    'pg_stat_statements.max',
+    'shared_buffers',
+    'effective_cache_size',
+    'work_mem',
+    'maintenance_work_mem',
+    'wal_buffers',
+    'max_wal_size',
+    'checkpoint_timeout',
+    'random_page_cost',
+    'seq_page_cost',
+    'max_parallel_workers',
+    'max_parallel_workers_per_gather',
+    'max_worker_processes',
+    'autovacuum',
+    'autovacuum_naptime',
+    'autovacuum_max_workers',
+    'autovacuum_vacuum_scale_factor',
+    'autovacuum_analyze_scale_factor'
   )
   ORDER BY name;
   "
+  echo "   (memory/cost values above feed the spill, cache-fit, and WAL findings —"
+  echo "    pg_stat_statements.track=top means SQL issued inside functions/triggers"
+  echo "    is not recorded separately; track=all records it at extra overhead)"
 
   local COMPUTE_QID TRACK_IO TRACK_WAL_IO IO_METHOD TRACK_DELAY
   local -a DO_PARAMS=()
