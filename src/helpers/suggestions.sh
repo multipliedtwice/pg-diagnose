@@ -2,7 +2,7 @@
 
 suggestions_mode() {
   local CLEANUP_PRED="severity <> 'CLEANUP'"
-  local SUGG_OUT SUGG_RC ERR_COUNT DBNAME STATS_DAYS SQL_LABEL FK_REFS_SQL FAILED_RULES
+  local SUGG_OUT SUGG_RC ERR_COUNT DBNAME STATS_DAYS SQL_LABEL FK_REFS_SQL FK_PLANREFS_SQL FAILED_RULES
   if [[ "$INCLUDE_CLEANUP" == "1" ]]; then
     CLEANUP_PRED="TRUE"
   fi
@@ -13,8 +13,10 @@ suggestions_mode() {
   fi
 
   FK_REFS_SQL="NULL::bigint"
+  FK_PLANREFS_SQL="NULL::bigint"
   if [[ "$HAS_PGSS" == "t" ]]; then
     FK_REFS_SQL="(SELECT count(*) FROM pg_stat_statements ps WHERE ps.query ~ ('\\m' || cl.relname || '\\M') AND ps.query ~ ('\\m' || fc.colname || '\\M'))"
+    FK_PLANREFS_SQL="(SELECT count(DISTINCT sc.queryid) FROM sg_clauses sc WHERE sc.clause ~ ('\\m' || fc.colname || '\\M'))"
   fi
 
   DBNAME="$(psql_get "SELECT current_database();" "unknown")"
@@ -43,10 +45,13 @@ suggestions_mode() {
   echo "   (evidence here is lifetime pg_stat_statements + catalogs;"
   echo "    window-level evidence requires a full run)"
   echo "   (statements are planned with EXPLAIN GENERIC_PLAN; when that fails,"
-  echo "    a fallback EXPLAIN with parameters replaced by NULL is attempted —"
-  echo "    fallback plans are used for operator detection only, never for"
-  echo "    selectivity-sensitive rules. Statements with no plan at all are"
-  echo "    listed below the coverage table with the planner's error.)"
+  echo "    the statement is retried with typed literals rewritten to casts —"
+  echo "    interval \$1 → \$1::interval, a form pgss normalization breaks —"
+  echo "    and finally with parameters replaced by NULL; rewritten plans are"
+  echo "    full generic plans, while null-param plans are used for operator"
+  echo "    detection only, never for selectivity-sensitive rules. Statements"
+  echo "    with no plan at all are listed below the coverage table with the"
+  echo "    planner's error.)"
   echo "   (active, enabled triggers are never judged droppable from statistics —"
   echo "    only disabled, duplicate, and never-firing triggers are flagged)"
   echo "   (coverage limit: plan-shape rules detect GIN-able filters, unused GIN"
@@ -54,10 +59,10 @@ suggestions_mode() {
   echo "    pagination, and disk spills; catalog/statistics rules detect stale"
   echo "    statistics, dead tuples, unindexed foreign keys, expensive-ANALYZE"
   echo "    vector columns, autoanalyze starvation, repeated expensive aggregates,"
-  echo "    and WAL buffer saturation. A plain missing btree index"
-  echo "    (WHERE col = \$1 running as a Seq Scan) is NOT auto-suggested:"
-  echo "    generic plans make it false-positive-prone. For those, start from the"
-  echo "    full run's 'heavy seq scans' section: $0 --deep-queryid=<queryid>)"
+  echo "    WAL buffer saturation, and indexes that extend a unique key. A plain"
+  echo "    missing btree index (WHERE col = \$1 running as a Seq Scan) is NOT"
+  echo "    auto-suggested: generic plans make it false-positive-prone. For those,"
+  echo "    start from the full run's 'heavy seq scans' section: $0 --deep-queryid=<queryid>)"
   if [[ "$PRISMA_OUT" == "1" ]]; then
     echo "   prisma output:"
     echo "     - model and field names are emitted as raw table/column names —"
@@ -161,7 +166,7 @@ BEGIN
     parts := parts || attr;
   END LOOP;
   IF m[5] IS NOT NULL THEN
-    notes := notes || 'partial index: requires previewFeatures = ["partialIndexes"] (Prisma >= 7.4, preview) — known migrate-dev drift bugs; verify migrations stay in sync or keep the raw SQL';
+    notes := notes || 'partial index: requires previewFeatures = ["partialIndexes"] (Prisma >= 7.4, preview — known migrate-dev drift bugs; verify migrations stay in sync or keep the raw SQL';
   END IF;
   notes := notes || ('Prisma cannot create indexes CONCURRENTLY — for a large live table run the raw SQL first, then baseline the migration: ' || trim(stmt));
   body := 'model ' || m[2] || ' {'
@@ -184,6 +189,13 @@ LANGUAGE sql AS \$fn\$
 \$fn\$;
 
 \if :has_pgss
+CREATE FUNCTION pg_temp.rewrite_typed_literals(q text) RETURNS text
+LANGUAGE sql AS \$fn\$
+  SELECT regexp_replace(q,
+    '\m(interval|date|timestamp(?:[[:space:]]+with(?:out)?[[:space:]]+time[[:space:]]+zone)?|time(?:[[:space:]]+with(?:out)?[[:space:]]+time[[:space:]]+zone)?)[[:space:]]+([\$][0-9]+)',
+    '\2::\1', 'gi')
+\$fn\$;
+
 CREATE FUNCTION pg_temp.explain_try(q text, OUT plan jsonb, OUT planmode text, OUT err text)
 LANGUAGE plpgsql AS \$fn\$
 DECLARE r json;
@@ -195,6 +207,14 @@ BEGIN
     RETURN;
   EXCEPTION WHEN OTHERS THEN
     err := SQLERRM;
+  END;
+  BEGIN
+    EXECUTE 'EXPLAIN (GENERIC_PLAN, VERBOSE, FORMAT JSON) ' || pg_temp.rewrite_typed_literals(q) INTO r;
+    plan := r::jsonb;
+    planmode := 'generic-rewritten';
+    RETURN;
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
   END;
   BEGIN
     EXECUTE 'EXPLAIN (VERBOSE, FORMAT JSON) '
@@ -253,11 +273,24 @@ WITH RECURSIVE nodes (queryid, calls, total_exec_time, mean_exec_time, planmode,
 )
 SELECT * FROM nodes;
 
+CREATE TEMP TABLE sg_clauses AS
+SELECT DISTINCT n.queryid,
+  concat_ws(' ',
+    n.node ->> 'Index Cond',
+    n.node ->> 'Recheck Cond',
+    n.node ->> 'Filter',
+    n.node ->> 'Join Filter',
+    n.node ->> 'Hash Cond',
+    n.node ->> 'Merge Cond') AS clause
+FROM sg_nodes n
+WHERE n.node ?| array['Index Cond','Recheck Cond','Filter','Join Filter','Hash Cond','Merge Cond'];
+
 \echo
 \echo '── plan coverage ──'
 SELECT
   count(*) AS stmts_checked,
   count(*) FILTER (WHERE planmode = 'generic') AS generic_plans,
+  count(*) FILTER (WHERE planmode = 'generic-rewritten') AS rewritten_generic_plans,
   count(*) FILTER (WHERE planmode = 'null-params') AS null_param_fallbacks,
   count(*) FILTER (WHERE plan IS NULL) AS unplannable
 FROM sg_plans;
@@ -267,15 +300,15 @@ FROM sg_plans;
 SELECT
   queryid,
   planmode,
-  left(err, 160) AS planner_error,
+  left(err, 200) AS planner_error,
   CASE WHEN plan IS NULL AND query ~ '(<->|<=>|<#>|<\+>)'
        THEN 'vector distance operator in text — ANN detection skipped, review manually'
        WHEN plan IS NULL AND query ~ '(@>|&&|<@)'
        THEN 'container operator in text — GIN detection skipped, review manually'
        ELSE '' END AS note,
-  left(query, 140) AS query
+  left(query, 400) AS query
 FROM sg_plans
-WHERE planmode <> 'generic'
+WHERE planmode NOT IN ('generic', 'generic-rewritten')
 ORDER BY total_exec_time DESC;
 
 CREATE TEMP TABLE sg_container AS
@@ -359,7 +392,8 @@ GROUP BY z.schemaname, z.relname, z.colname;
 \echo '-- rule:ann-missing-index'
 INSERT INTO sugg
 SELECT
-  'HIGH', 'HIGH',
+  'HIGH',
+  CASE WHEN x.param_target THEN 'HIGH' ELSE 'LOW' END,
   'Missing ANN index (vector distance sort)',
   x.top_queryid,
   x.schemaname || '.' || x.relname,
@@ -371,10 +405,15 @@ SELECT
     || quote_ident(x.colname) || ' ' || x.op
     || ' <param> LIMIT n directly. Results become APPROXIMATE (recall vs speed: hnsw.ef_search). The index is used ONLY when the ORDER BY expression is the bare ascending distance — rewrite forms like (constant - (col '
     || x.op || ' v)) DESC to the bare distance and derive similarity in the select list. A partial index (e.g. WHERE "deletedAt" IS NULL AND '
-    || quote_ident(x.colname) || ' IS NOT NULL) is smaller, but every query must repeat the predicate verbatim.',
+    || quote_ident(x.colname) || ' IS NOT NULL) is smaller, but every query must repeat the predicate verbatim.'
+    || CASE WHEN x.param_target THEN ''
+            ELSE ' DETECTED: this sort expression computes the distance between two columns (pairwise) — no index serves a global sort over pairwise distances; restructure as a LATERAL nested loop (per outer row: ORDER BY inner.'
+              || quote_ident(x.colname) || ' ' || x.op || ' outer.' || quote_ident(x.colname)
+              || ' LIMIT k) so the index can serve the inner scan.' END,
   'queries=' || x.queries || ' queryids=[' || x.queryids || ']'
     || ' combined_total_ms=' || x.total_ms
     || ' pgvector=' || coalesce((SELECT extversion FROM pg_extension WHERE extname = 'vector'), 'not installed')
+    || ' target=' || CASE WHEN x.param_target THEN 'parameter/constant' ELSE 'column (pairwise)' END
     || ' sort_expr: ' || left(x.expr, 160),
   '$0 --deep-queryid=' || x.top_queryid,
   'Approximate results; combined with selective filters it can return fewer than LIMIT rows (pgvector >= 0.8: hnsw.iterative_scan). The build is memory/time heavy (maintenance_work_mem) and every write to ' || x.colname || ' updates the graph.',
@@ -386,10 +425,11 @@ FROM (
     sum(z.total_exec_time)::bigint AS total_ms,
     (array_agg(z.queryid ORDER BY z.total_exec_time DESC))[1] AS top_queryid,
     string_agg(z.queryid::text, ', ' ORDER BY z.total_exec_time DESC) AS queryids,
-    max(z.expr) AS expr
+    max(z.expr) AS expr,
+    bool_or(z.param_target) AS param_target
   FROM (
     SELECT DISTINCT ON (y.schemaname, y.relname, y.colname, y.op, y.queryid)
-      y.schemaname, y.relname, y.colname, y.op, y.queryid, y.total_exec_time, y.expr
+      y.schemaname, y.relname, y.colname, y.op, y.queryid, y.total_exec_time, y.expr, y.param_target
     FROM (
       WITH lim AS (
         SELECT DISTINCT queryid FROM sg_nodes WHERE node ->> 'Node Type' = 'Limit'
@@ -410,7 +450,8 @@ FROM (
         WHERE n.node ? 'Relation Name'
       )
       SELECT d.queryid, d.total_exec_time, r.schemaname, r.relname, d.sk0 AS expr,
-        k.m[1] AS colname, k.m[2] AS op
+        k.m[1] AS colname, k.m[2] AS op,
+        (d.sk0 ~ '(<->|<=>|<#>|<\+>)[[:space:]]*\(*([\$][0-9]+|'')') AS param_target
       FROM dsorts d
       JOIN rels r USING (queryid)
       CROSS JOIN LATERAL (
@@ -610,7 +651,7 @@ SELECT
             THEN ' Predicate contains parameters and no equality columns were detected — suggested index is unpartial and may be large; verify first.'
             ELSE '' END,
   'queryid=' || raw.queryid || ' calls=' || raw.calls || ' total_ms=' || raw.total_exec_time::int
-    || ' workload_share=' || round(100.0 * raw.total_exec_time / NULLIF(w.total_ms, 0), 1) || '%'
+    || ' workload_share=' || round((100.0 * raw.total_exec_time / NULLIF(w.total_ms, 0))::numeric, 1) || '%'
     || ' mean_ms=' || raw.mean_exec_time::int || ' sort_key=' || raw.sk0
     || coalesce(' eq_cols=' || ec.eq_cols, '')
     || ' scan_predicate: ' || left(raw.pred_clean, 160),
@@ -621,7 +662,8 @@ SELECT
 FROM (
   WITH lim AS (
     SELECT DISTINCT queryid FROM sg_nodes
-    WHERE node ->> 'Node Type' = 'Limit' AND planmode = 'generic'
+    WHERE node ->> 'Node Type' = 'Limit'
+      AND planmode IN ('generic', 'generic-rewritten')
   ),
   sorts AS (
     SELECT n.queryid,
@@ -630,7 +672,7 @@ FROM (
     FROM sg_nodes n
     JOIN lim USING (queryid)
     WHERE n.node ->> 'Node Type' IN ('Sort', 'Incremental Sort')
-      AND n.planmode = 'generic'
+      AND n.planmode IN ('generic', 'generic-rewritten')
   ),
   scans AS (
     SELECT n.queryid,
@@ -647,7 +689,7 @@ FROM (
     JOIN lim USING (queryid)
     WHERE n.node ->> 'Node Type' IN ('Seq Scan', 'Bitmap Heap Scan')
       AND (n.node ? 'Filter' OR n.node ? 'Recheck Cond')
-      AND n.planmode = 'generic'
+      AND n.planmode IN ('generic', 'generic-rewritten')
   )
   SELECT t.queryid, t.calls, t.total_exec_time, t.mean_exec_time,
     so.sk0,
@@ -799,6 +841,11 @@ FROM (
 ) t;
 \endif
 
+\if :has_pgss
+\else
+CREATE TEMP TABLE sg_clauses (queryid bigint, clause text);
+\endif
+
 \echo '-- rule:stale-statistics'
 INSERT INTO sugg
 SELECT
@@ -891,7 +938,7 @@ SELECT
     || ' total_size=' || x.size,
   're-run $0 --only=tables after a few days and confirm autoanalyze_count is increasing',
   'ANALYZE runs become more frequent (brief ShareUpdateExclusiveLock and sampling I/O each time). If an expensive-ANALYZE suggestion targets the same table, apply that one first or every run stays slow.',
-  'The table was bulk-loaded recently and autovacuum has simply not reached it yet, or statistics were reset recently.',
+  'The table was bulk-loaded recently and autovacuum has simply not reached it yet, statistics were reset recently, or an external maintenance job already owns ANALYZE scheduling for this table.',
   19
 FROM (
   SELECT
@@ -967,8 +1014,8 @@ WHERE w.wal_buffers_full > 0.5 * w.wal_records;
 INSERT INTO sugg
 SELECT
   'MEDIUM',
-  CASE WHEN bool_or(coalesce(f.pgss_refs, 0) > 0) THEN 'HIGH'
-       WHEN bool_or((f.parent_del > 0 OR f.parent_upd > 0)
+  CASE WHEN bool_or(coalesce(f.plan_refs, 0) > 0) THEN 'HIGH'
+       WHEN bool_or(f.parent_del > 0
                     AND f.del_action IN ('CASCADE', 'SET NULL', 'SET DEFAULT', 'RESTRICT')) THEN 'MEDIUM'
        WHEN '${HAS_PGSS}' <> 't' THEN 'MEDIUM'
        ELSE 'LOW' END,
@@ -976,7 +1023,7 @@ SELECT
   NULL,
   f.child_table,
   string_agg(f.ddl, chr(10) ORDER BY f.conname),
-  'These foreign-key columns have no covering btree index: joins on them scan the whole table, and DELETE/UPDATE on the referenced parent must scan this table to check the constraint. Confidence is corroborated against observed parent-table delete/update activity and references to the column near the child table name in recorded statements (pgss_refs).'
+  'These foreign-key columns have no covering btree index: joins on them scan the whole table, and DELETE (or key-changing UPDATE) of referenced parent rows must scan this table to check the constraint. Non-key parent updates, including HOT updates, never fire RI checks. Confidence comes from plan_refs — the column appearing in predicates or join conditions of the collected top-statement plans; text_refs (raw mentions in statement text) is shown for context only, since ORMs project every column into every statement.'
     || CASE WHEN bool_or(f.soft)
             THEN ' Parents marked (soft-delete) below are rarely hard-deleted — for those, index only if the column is used in joins.'
             ELSE '' END,
@@ -984,14 +1031,14 @@ SELECT
              || CASE WHEN f.soft THEN ' (soft-delete parent)' ELSE '' END
              || ' on_delete=' || f.del_action
              || ' parent_del=' || f.parent_del
-             || ' parent_upd=' || f.parent_upd
-             || ' pgss_refs=' || coalesce(f.pgss_refs::text, 'n/a'),
+             || ' plan_refs=' || coalesce(f.plan_refs::text, 'n/a')
+             || ' text_refs=' || coalesce(f.pgss_refs::text, 'n/a'),
              '; ' ORDER BY f.conname)
     || ' child_size=' || max(f.child_size)
     || ' child_writes=' || max(f.child_writes),
   'EXPLAIN (ANALYZE, BUFFERS) a join on these columns; re-run $0 --only=indexes after creating',
   'Every write to this table must also update each new index (writes become slightly slower).',
-  'Parent rows are never hard-deleted or key-updated AND the join path is cold. pgss_refs is a text match against normalized statements and can over- or under-count.',
+  'Parent rows are never hard-deleted AND the join path is cold. plan_refs covers only the collected top statements, so 0 does not prove the column is never joined on; text_refs over- and under-counts.',
   30
 FROM (
   SELECT
@@ -1002,8 +1049,8 @@ FROM (
          WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT'
          ELSE 'NO ACTION' END AS del_action,
     coalesce(pst.n_tup_del, 0) AS parent_del,
-    coalesce(pst.n_tup_upd, 0) AS parent_upd,
     ${FK_REFS_SQL} AS pgss_refs,
+    ${FK_PLANREFS_SQL} AS plan_refs,
     'CREATE INDEX CONCURRENTLY IF NOT EXISTS '
       || quote_ident(pg_temp.idx_name(c.conname || '_idx'))
       || ' ON ' || quote_ident(n.nspname) || '.' || quote_ident(cl.relname)
@@ -1096,7 +1143,44 @@ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
     = (i1.indoption::smallint[])[0:i1.indnkeyatts - 1]
   AND (i1.indnkeyatts < i2.indnkeyatts
        OR i2.indnatts > i2.indnkeyatts
+       OR i2.indisunique
+       OR EXISTS (SELECT 1 FROM pg_constraint cc2 WHERE cc2.conindid = i2.indexrelid)
        OR i1.indexrelid > i2.indexrelid);
+
+\echo '-- rule:unique-extension-index'
+INSERT INTO sugg
+SELECT
+  'CLEANUP', 'LOW', 'Index extends a unique key (trailing columns cannot narrow further)',
+  NULL,
+  n.nspname || '.' || t.relname,
+  'DROP INDEX CONCURRENTLY ' || quote_ident(n.nspname) || '.' || quote_ident(ci1.relname) || ';',
+  'The leading ' || i2.indnkeyatts || ' column(s) of ' || ci1.relname || ' are exactly the key set of unique index ' || ci2.relname || ': at most one row matches any leading-key value, so the trailing columns can never reduce the result further. The only remaining value of this index is as a covering index for index-only scans returning the trailing columns.',
+  'extension=' || pg_get_indexdef(i1.indexrelid) || ' || unique=' || pg_get_indexdef(i2.indexrelid)
+    || ' size=' || pg_size_pretty(pg_relation_size(i1.indexrelid))
+    || ' scans=' || coalesce(ui1.idx_scan, 0),
+  'verify no query relies on an index-only scan over the trailing columns, then DROP INDEX CONCURRENTLY; never urgent',
+  'Lookups shift to ' || ci2.relname || '; index-only scans that returned trailing columns become heap fetches.',
+  'Queries do index-only scans selecting the trailing columns, or the unique index may be dropped or relaxed.',
+  55
+FROM pg_index i1
+JOIN pg_index i2 ON i2.indrelid = i1.indrelid AND i2.indexrelid <> i1.indexrelid
+JOIN pg_class ci1 ON ci1.oid = i1.indexrelid
+JOIN pg_class ci2 ON ci2.oid = i2.indexrelid
+JOIN pg_class t ON t.oid = i1.indrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+LEFT JOIN pg_stat_user_indexes ui1 ON ui1.indexrelid = i1.indexrelid
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND i2.indisunique
+  AND NOT i1.indisunique
+  AND i1.indisvalid AND i2.indisvalid
+  AND i1.indpred IS NULL AND i2.indpred IS NULL
+  AND i1.indexprs IS NULL AND i2.indexprs IS NULL
+  AND NOT i1.indisreplident
+  AND NOT i1.indisclustered
+  AND NOT EXISTS (SELECT 1 FROM pg_constraint cc WHERE cc.conindid = i1.indexrelid)
+  AND i1.indnkeyatts > i2.indnkeyatts
+  AND (i1.indkey::smallint[])[0:i2.indnkeyatts - 1] @> (i2.indkey::smallint[])[0:i2.indnkeyatts - 1]
+  AND (i2.indkey::smallint[])[0:i2.indnkeyatts - 1] @> (i1.indkey::smallint[])[0:i2.indnkeyatts - 1];
 
 \echo '-- rule:unused-index'
 INSERT INTO sugg

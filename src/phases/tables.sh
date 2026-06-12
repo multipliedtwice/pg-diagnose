@@ -25,7 +25,7 @@ phase_tables() {
   LIMIT 30;
   "
 
-  run_section "top tables by maintenance time (PG18, evidence: lifetime)" "
+  run_section "top tables by maintenance time (PG18, evidence: lifetime; ranked by vacuum+analyze combined)" "
   SELECT
     schemaname || '.' || relname AS table,
     (total_vacuum_time + total_autovacuum_time)::bigint AS vacuum_ms,
@@ -42,7 +42,8 @@ phase_tables() {
   WHERE schemaname NOT LIKE 'pg\_temp%'
     AND total_vacuum_time + total_autovacuum_time
       + total_analyze_time + total_autoanalyze_time > 0
-  ORDER BY total_vacuum_time + total_autovacuum_time DESC
+  ORDER BY total_vacuum_time + total_autovacuum_time
+         + total_analyze_time + total_autoanalyze_time DESC
   LIMIT 15;
   "
 

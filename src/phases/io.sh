@@ -121,7 +121,7 @@ phase_io() {
   ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST;
   "
 
-  run_section "replication peers" "
+  run_section "replication peers (backup receivers annotated — their replay_lag grows by design)" "
   SELECT
     application_name,
     client_addr,
@@ -132,7 +132,10 @@ phase_io() {
     pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint) AS replay_lag_bytes,
     write_lag,
     flush_lag,
-    replay_lag
+    replay_lag,
+    CASE WHEN application_name ~* 'pghoard|wal-g|wal_g|barman|pgbackrest|pg_receivewal'
+         THEN 'backup receiver — does not replay; flush_lag is the meaningful metric'
+         ELSE '' END AS note
   FROM pg_stat_replication;
   "
 }

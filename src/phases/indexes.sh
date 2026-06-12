@@ -19,7 +19,7 @@ phase_indexes() {
     echo "      (zero-scan indexes especially) is weak; do not act on it yet."
   fi
 
-  run_section "all user indexes (complete inventory; evidence: static — use this to reconcile against your ORM schema / spot out-of-band indexes)" "
+  run_section "all user indexes (complete inventory; evidence: static — use this to reconcile against your ORM schema / spot out-of-band indexes and tables)" "
   SELECT
     s.schemaname || '.' || s.relname AS table,
     s.indexrelname AS index,
@@ -102,7 +102,7 @@ phase_indexes() {
     echo "   (+${HIDDEN_FK} unindexed FK(s) on small/cold child tables hidden — below 10MB and 100 writes)"
   fi
 
-  run_section "redundant indexes (prefix-covered; verify both definitions before DROP; scans of the redundant index shift to the covering one after DROP)" "
+  run_section "redundant indexes (prefix-covered or equal to a unique index; verify both definitions before DROP; scans of the redundant index shift to the covering one after DROP)" "
   SELECT
     n.nspname || '.' || t.relname AS table,
     ci1.relname AS redundant_index,
@@ -139,6 +139,8 @@ phase_indexes() {
       = (i1.indoption::smallint[])[0:i1.indnkeyatts - 1]
     AND (i1.indnkeyatts < i2.indnkeyatts
          OR i2.indnatts > i2.indnkeyatts
+         OR i2.indisunique
+         OR EXISTS (SELECT 1 FROM pg_constraint cc2 WHERE cc2.conindid = i2.indexrelid)
          OR i1.indexrelid > i2.indexrelid)
   ORDER BY pg_relation_size(i1.indexrelid) DESC;
   " -x
@@ -175,8 +177,9 @@ phase_indexes() {
   echo
   echo "── plan-driven index candidates ──"
   echo "   (EXPLAIN GENERIC_PLAN on top pg_stat_statements queries; statements the"
-  echo "    generic planner rejects are retried with parameters replaced by NULL —"
-  echo "    those plans are marked null-params and their est_rows are meaningless)"
+  echo "    generic planner rejects are retried with typed literals rewritten to"
+  echo "    casts — interval \$1 → \$1::interval — and then with parameters replaced"
+  echo "    by NULL; null-params plans have meaningless est_rows)"
   echo "   Seq Scan + Filter            → index candidate on filter columns"
   echo "   Index/Bitmap scan + Filter   → rows fetched by index then discarded → extend index or partial predicate"
   echo "   large Sort                   → index providing order, or work_mem"
@@ -187,6 +190,13 @@ phase_indexes() {
   psql_run_tolerant <<IDX_SQL
 SET statement_timeout = '180s';
 SET lock_timeout = '2s';
+
+CREATE FUNCTION pg_temp.rewrite_typed_literals(q text) RETURNS text
+LANGUAGE sql AS \$fn\$
+  SELECT regexp_replace(q,
+    '\m(interval|date|timestamp(?:[[:space:]]+with(?:out)?[[:space:]]+time[[:space:]]+zone)?|time(?:[[:space:]]+with(?:out)?[[:space:]]+time[[:space:]]+zone)?)[[:space:]]+([\$][0-9]+)',
+    '\2::\1', 'gi')
+\$fn\$;
 
 CREATE FUNCTION pg_temp.explain_try(q text, OUT plan jsonb, OUT planmode text, OUT err text)
 LANGUAGE plpgsql AS \$fn\$
@@ -199,6 +209,14 @@ BEGIN
     RETURN;
   EXCEPTION WHEN OTHERS THEN
     err := SQLERRM;
+  END;
+  BEGIN
+    EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) ' || pg_temp.rewrite_typed_literals(q) INTO r;
+    plan := r::jsonb;
+    planmode := 'generic-rewritten';
+    RETURN;
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
   END;
   BEGIN
     EXECUTE 'EXPLAIN (FORMAT JSON) '
@@ -244,6 +262,7 @@ CROSS JOIN LATERAL pg_temp.explain_try(t.query) e;
 SELECT
   count(*) AS stmts_checked,
   count(*) FILTER (WHERE planmode = 'generic') AS generic_plans,
+  count(*) FILTER (WHERE planmode = 'generic-rewritten') AS rewritten_generic_plans,
   count(*) FILTER (WHERE planmode = 'null-params') AS null_param_fallbacks,
   count(*) FILTER (WHERE plan IS NULL) AS unplannable
 FROM ix_plans;
@@ -253,15 +272,15 @@ FROM ix_plans;
 SELECT
   queryid,
   planmode,
-  left(err, 160) AS planner_error,
+  left(err, 200) AS planner_error,
   CASE WHEN plan IS NULL AND query ~ '(<->|<=>|<#>|<\+>)'
        THEN 'vector distance operator in text — review manually'
        WHEN plan IS NULL AND query ~ '(@>|&&|<@)'
        THEN 'container operator in text — review manually'
        ELSE '' END AS note,
-  left(query, 140) AS query
+  left(query, 400) AS query
 FROM ix_plans
-WHERE planmode <> 'generic'
+WHERE planmode NOT IN ('generic', 'generic-rewritten')
 ORDER BY total_exec_time DESC;
 
 CREATE TEMP TABLE ix_nodes AS

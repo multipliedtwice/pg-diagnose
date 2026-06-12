@@ -12,7 +12,6 @@ MODE=""
 INCLUDE_CLEANUP=0
 SHOW_LOW_SQL=0
 PRISMA_OUT=0
-DEBUG=0
 RUN_FAILED=0
 VERDICT_FILE=""
 VALID_PHASES=",config,snapshot,window,progress,history,io,tables,indexes,triggers,"

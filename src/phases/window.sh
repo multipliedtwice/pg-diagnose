@@ -477,7 +477,7 @@ ORDER BY s.total_exec_time - coalesce(b.total_exec_time, 0) DESC
 LIMIT 1;
 \endif
 
-SELECT E'  no active workload was observed during this ${SAMPLE_SECONDS}s window\n  re-run while the problem is happening:\n    SAMPLE_SECONDS=60 $0 --only=window'
+SELECT E'  no backend-samples were captured during this ${SAMPLE_SECONDS}s window —\n  active queries may have completed between 1Hz sampler ticks, so the\n  exec-time delta line above (pg_stat_statements counters) remains valid\n  for sustained load, re-run while the problem is happening:\n    SAMPLE_SECONDS=60 $0 --only=window'
 WHERE NOT EXISTS (SELECT 1 FROM diag_samples);
 
 \pset tuples_only off
