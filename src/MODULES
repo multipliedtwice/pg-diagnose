@@ -5,6 +5,7 @@ plansql.sh
 helpers/banner.sh
 helpers/explain.sh
 helpers/deep.sh
+helpers/probe.sh
 helpers/suggestions/setup.sh
 helpers/suggestions/catalog.sh
 helpers/suggestions/collect.sh

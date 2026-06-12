@@ -5,6 +5,10 @@ main() {
     explain_queryid_helper
     return "$RUN_FAILED"
   fi
+  if [[ -n "$PROBE_QUERYID" ]]; then
+    probe_queryid_helper
+    return "$RUN_FAILED"
+  fi
   if [[ -n "$DEEP_QUERYID" ]]; then
     deep_queryid_helper
     return "$RUN_FAILED"
@@ -39,6 +43,7 @@ main() {
   echo "  next steps:"
   echo "    ranked candidate actions:   $0 --mode=suggestions"
   echo "    one query in depth:         $0 --deep-queryid=<queryid>"
+  echo "    measured plan, no setup:    $0 --probe-queryid=<queryid>"
   if [[ "$RUN_FAILED" -ne 0 ]]; then
     echo
     echo "  ⚠  one or more sections failed — the report above is incomplete (exit code 1)"

@@ -15,6 +15,21 @@ WHERE category = 'Missing index for sorted pagination'
     HAVING count(*) > 2
   );
 
+UPDATE sugg s SET
+  detail = concat_ws('; ', s.detail,
+    'competing access paths on the same queryid (GIN-filter vs ordered-scan) — run \$0 --probe-queryid='
+      || s.queryid || ' for the chosen plan before adding or dropping anything')
+WHERE s.queryid IS NOT NULL
+  AND s.queryid IN (
+    SELECT queryid FROM sugg
+    WHERE category IN (
+      'Existing GIN index not chosen by the planner',
+      'Ordered index exists but planner not choosing it (sorted pagination)'
+    )
+    GROUP BY queryid
+    HAVING count(DISTINCT category) > 1
+  );
+
 \echo '-- rule:output'
 \echo
 \echo '── result ──'
