@@ -1,3 +1,22 @@
+#!/usr/bin/env bash
+
+print_banner() {
+  echo
+  echo "╔═══════════════════════════════════════════════════════"
+  echo "║   PostgreSQL CPU Diagnosis"
+  echo "║   window=${SAMPLE_SECONDS}s  server=PostgreSQL ${PG_VERSION}"
+  echo "╚═══════════════════════════════════════════════════════"
+  echo "  read the Summary section at the very end of the report first"
+  echo "  evidence classes, tiers, methodology: $0 --legend  (docs/interpreting-output.md)"
+  echo "  ranked actions: $0 --mode=suggestions   one query: $0 --deep-queryid=<queryid>"
+  if [[ "$HAS_READ_ALL_STATS" != "t" ]]; then
+    echo
+    echo "  ⚠ current role lacks pg_read_all_stats: query text/query IDs of other"
+    echo "    users' sessions and per-backend WAL/I-O statistics may be hidden or"
+    echo "    NULL. Sections relying on them will under-report, not error."
+  fi
+}
+
 print_legend() {
   cat <<'LEGEND'
 pg-diagnose — legend and methodology
