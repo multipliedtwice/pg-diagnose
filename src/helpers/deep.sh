@@ -2,6 +2,9 @@
 
 deep_queryid_helper() {
   local DEEP_OUT DEEP_RC DEEP_ERRS
+  local PLAN_SOURCE_SQL PLAN_TEXT_SECTION PLAN_ORIGIN
+  local REAL_PLAN="" TMP_EXPLAIN EXPLAIN_RC
+  local -a EXTRA_ARGS=()
 
   if ! [[ "$DEEP_QUERYID" =~ ^-?[0-9]+$ ]]; then
     echo "--deep-queryid must be a bigint queryid (got: $DEEP_QUERYID)" >&2
@@ -12,17 +15,62 @@ deep_queryid_helper() {
     exit 1
   fi
 
+  PLAN_ORIGIN="generic"
+  if [[ -n "$EXPLAIN_SQL_FILE" ]]; then
+    if [[ ! -s "$EXPLAIN_SQL_FILE" ]]; then
+      echo "--explain-sql file is missing or empty: ${EXPLAIN_SQL_FILE}" >&2
+      exit 1
+    fi
+    TMP_EXPLAIN="$(mktemp "${TMPDIR:-/tmp}/pg-diagnose-explain.XXXXXX")"
+    printf 'EXPLAIN (VERBOSE, FORMAT JSON) ' > "$TMP_EXPLAIN"
+    cat "$EXPLAIN_SQL_FILE" >> "$TMP_EXPLAIN"
+    set +e
+    REAL_PLAN="$(psql_run_tolerant -At -f "$TMP_EXPLAIN" 2>/dev/null)"
+    EXPLAIN_RC=$?
+    set -e
+    rm -f "$TMP_EXPLAIN"
+    if [[ $EXPLAIN_RC -ne 0 || -z "$REAL_PLAN" || "$REAL_PLAN" != \[* ]]; then
+      echo "   ⚠  could not obtain a real plan from --explain-sql (statement rejected by EXPLAIN," >&2
+      echo "      multiple statements in file, or syntax error) — falling back to the generic plan." >&2
+      REAL_PLAN=""
+    else
+      PLAN_ORIGIN="real"
+    fi
+  fi
+
+  if [[ "$PLAN_ORIGIN" == "real" ]]; then
+    PLAN_SOURCE_SQL="CREATE TEMP TABLE deep_plan AS SELECT :'real_plan'::jsonb AS plan;"
+    PLAN_TEXT_SECTION="\echo
+\echo '── plan source ──'
+\echo '   real-selectivity plan from --explain-sql (EXPLAIN only — the statement was NOT executed).'
+\echo '   parameter selectivity reflects the literals in the supplied statement, not planner defaults.'"
+    EXTRA_ARGS=(-v "real_plan=${REAL_PLAN}")
+  else
+    PLAN_SOURCE_SQL="CREATE TEMP TABLE deep_plan AS SELECT pg_temp.explain_generic(query) AS plan FROM deep_q;"
+    PLAN_TEXT_SECTION="\echo
+\echo '── generic plan (text) ──'
+SELECT pg_temp.explain_generic_text(query) AS generic_plan FROM deep_q;"
+  fi
+
   echo
   echo "╔═══════════════════════════════════════════════════════╗"
   echo "║   Deep diagnosis: queryid=${DEEP_QUERYID}"
   echo "║   evidence for index/query design — no auto-DDL       ║"
   echo "╚═══════════════════════════════════════════════════════╝"
-  echo "   (plan-derived sections use the generic plan: parameter selectivity is"
-  echo "    estimated with defaults, so est. rows are crude — design from the"
-  echo "    table/column stats and verify with EXPLAIN ANALYZE on real params)"
+  if [[ "$PLAN_ORIGIN" == "real" ]]; then
+    echo "   plan source: --explain-sql (real selectivity; statement NOT executed)"
+    echo "   pg_stat_statements metrics below are workload context for the named queryid;"
+    echo "   you are asserting the supplied statement corresponds to it."
+  else
+    echo "   (plan-derived sections use the generic plan: parameter selectivity is"
+    echo "    estimated with defaults, so est. rows are crude. For a real-selectivity"
+    echo "    plan with no manual EXPLAIN, capture one slow-query statement with literals"
+    echo "    (log_min_duration_statement / auto_explain) and pass it via:"
+    echo "      $0 --deep-queryid=${DEEP_QUERYID} --explain-sql=stmt.sql)"
+  fi
 
   set +e
-  DEEP_OUT="$(psql_run_tolerant 2>&1 <<DEEP_SQL
+  DEEP_OUT="$(psql_run_tolerant "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" 2>&1 <<DEEP_SQL
 SET statement_timeout = '120s';
 SET lock_timeout = '2s';
 
@@ -80,8 +128,7 @@ SELECT
 FROM deep_q;
 \x off
 
-CREATE TEMP TABLE deep_plan AS
-SELECT pg_temp.explain_generic(query) AS plan FROM deep_q;
+${PLAN_SOURCE_SQL}
 
 CREATE TEMP TABLE deep_nodes AS
 WITH RECURSIVE nodes(node) AS (
@@ -102,7 +149,7 @@ FROM deep_nodes
 WHERE node ? 'Relation Name';
 
 \echo
-\echo '── referenced tables (from generic plan) ──'
+\echo '── referenced tables (from plan) ──'
 SELECT
   r.schemaname || '.' || c.relname AS table,
   CASE WHEN c.reltuples < 0 THEN '-1 (never analyzed)'
@@ -182,9 +229,7 @@ WHERE CASE WHEN st.attname ~ '^[A-Za-z_][A-Za-z0-9_]*\$'
            ELSE strpos(cl.alltext, st.attname) > 0 END
 ORDER BY 1, 2;
 
-\echo
-\echo '── generic plan (text) ──'
-SELECT pg_temp.explain_generic_text(query) AS generic_plan FROM deep_q;
+${PLAN_TEXT_SECTION}
 DEEP_SQL
 )"
   DEEP_RC=$?
@@ -204,11 +249,15 @@ DEEP_SQL
   fi
 
   echo
-  echo "  Next: substitute real parameter values into the statement text above and run:"
-  echo
-  echo "    EXPLAIN (ANALYZE, BUFFERS, WAL, VERBOSE) <query with real params>;"
-  echo
-  echo "  EXPLAIN ANALYZE executes the statement — wrap writes in BEGIN; ... ROLLBACK;."
-  echo "  Real parameter values come from your application logs or"
-  echo "  log_min_duration_statement on the cluster."
+  if [[ "$PLAN_ORIGIN" == "real" ]]; then
+    echo "  The plan above used real selectivity from the supplied statement and was NOT executed."
+    echo "  To measure actual timing, run EXPLAIN (ANALYZE, BUFFERS, WAL, VERBOSE) yourself on a"
+    echo "  read-only copy of the statement; for writes, wrap in BEGIN; ... ROLLBACK;."
+  else
+    echo "  Real parameter values are not stored in pg_stat_statements, so the plan above is"
+    echo "  generic. To get a real-selectivity plan without leaving this tool, capture one"
+    echo "  slow-query statement (literals inline) and re-run with --explain-sql=<file>."
+    echo "  For measured timing, EXPLAIN (ANALYZE, BUFFERS, WAL, VERBOSE) executes the statement —"
+    echo "  wrap writes in BEGIN; ... ROLLBACK;."
+  fi
 }

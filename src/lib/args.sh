@@ -66,6 +66,7 @@ parse_args() {
       --output-dir=*) OUTPUT_DIR="${arg#--output-dir=}" ;;
       --explain-queryid=*) EXPLAIN_QUERYID="${arg#--explain-queryid=}" ;;
       --deep-queryid=*) DEEP_QUERYID="${arg#--deep-queryid=}" ;;
+      --explain-sql=*) EXPLAIN_SQL_FILE="${arg#--explain-sql=}" ;;
       --mode=*) MODE="${arg#--mode=}" ;;
       --include-cleanup) INCLUDE_CLEANUP=1 ;;
       --show-low-confidence-sql) SHOW_LOW_SQL=1 ;;
@@ -86,6 +87,11 @@ parse_args() {
       echo "--include-cleanup and --show-low-confidence-sql require --mode=suggestions or --mode=prisma" >&2
       usage
     fi
+  fi
+
+  if [[ -n "$EXPLAIN_SQL_FILE" && -z "$DEEP_QUERYID" ]]; then
+    echo "--explain-sql requires --deep-queryid=<id>" >&2
+    usage
   fi
 
   local exclusive=0

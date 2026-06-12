@@ -75,8 +75,6 @@ SUGG_SQL
 
   ERR_COUNT="$(count_sql_errors "$SUGG_OUT")"
 
-  printf '%s\n' "$SUGG_OUT" | grep -vE '^-- rule:' || true
-
   if [[ $SUGG_RC -ne 0 || "${ERR_COUNT:-0}" -gt 0 ]]; then
     RUN_FAILED=1
     FAILED_RULES="$(awk '/^-- rule:/ { r = substr($0, 9) }
@@ -85,11 +83,15 @@ SUGG_SQL
     echo
     echo "╔═══════════════════════════════════════════════════════"
     echo "║  ⚠  ${ERR_COUNT:-?} SQL error(s) occurred in rule(s): ${FAILED_RULES:-unknown}"
-    echo "║     Suggestions from those rules are missing or partial."
+    echo "║     Suggestions from those rules are MISSING, and the result"
+    echo "║     totals below DO NOT account for them — treat counts as a"
+    echo "║     lower bound only."
     echo "║     If 'setup' is listed, plan-based rules are unreliable —"
     echo "║     trust only catalog rules from this run."
     echo "╚═══════════════════════════════════════════════════════"
   fi
+
+  printf '%s\n' "$SUGG_OUT" | grep -vE '^-- rule:' || true
 
   if [[ $SUGG_RC -ne 0 ]]; then
     RUN_FAILED=1

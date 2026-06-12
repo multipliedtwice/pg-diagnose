@@ -122,7 +122,7 @@ FROM (
     FROM sg_nodes n
     CROSS JOIN LATERAL (
       SELECT coalesce(n.node ->> 'Alias', n.node ->> 'Relation Name') AS als,
-             nullif(concat_ws(' ', n.node ->> 'Filter', n.node ->> 'Recheck Cond'), '') AS rawpred
+             nullif(concat_ws(' AND ', n.node ->> 'Filter', n.node ->> 'Recheck Cond'), '') AS rawpred
     ) al
     CROSS JOIN LATERAL (
       SELECT regexp_replace(
@@ -138,23 +138,34 @@ FROM (
 GROUP BY z.schemaname, z.relname, z.colname;
 
 CREATE TEMP TABLE sg_like AS
-SELECT z.schemaname, z.relname, z.colname,
+SELECT
+  z.schemaname, z.relname, z.patcols,
   count(*) AS queries,
   sum(z.total_exec_time)::bigint AS total_ms,
   sum(z.calls)::bigint AS calls,
   (array_agg(z.queryid ORDER BY z.total_exec_time DESC))[1] AS top_queryid,
   string_agg(z.queryid::text, ', ' ORDER BY z.total_exec_time DESC) AS queryids,
-  max(z.pred) AS pred
+  max(z.pred) AS pred,
+  bool_or(z.or_present) AS or_present,
+  bool_or(z.nonpattern_or) AS nonpattern_or,
+  bool_or(z.any_form) AS any_form
 FROM (
-  SELECT DISTINCT ON (y.schemaname, y.relname, y.colname, y.queryid)
-    y.schemaname, y.relname, y.colname, y.queryid, y.calls, y.total_exec_time, y.pred
+  SELECT DISTINCT ON (y.schemaname, y.relname, y.patcols, y.queryid)
+    y.schemaname, y.relname, y.patcols, y.queryid, y.calls, y.total_exec_time,
+    y.pred, y.or_present, y.nonpattern_or, y.any_form
   FROM (
     SELECT n.queryid, n.calls, n.total_exec_time,
       coalesce(n.node ->> 'Schema', 'public') AS schemaname,
       n.node ->> 'Relation Name' AS relname,
       q.pred,
-      (regexp_match(q.pred,
-        '(?<![."A-Za-z0-9_])"?([A-Za-z_][A-Za-z0-9_]*)"?\)?[[:space:]]*(~~[*]|~~|~[*])'))[1] AS colname
+      (
+        SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+        FROM regexp_matches(q.pred,
+          '(?<![."A-Za-z0-9_])"?([A-Za-z_][A-Za-z0-9_]*)"?\)?[[:space:]]*(?:~~[*]|~~|~[*])', 'g') AS m
+      ) AS patcols,
+      (position(' OR ' in q.pred) > 0) AS or_present,
+      (position(' OR ' in q.pred) > 0 AND q.pred ~ 'SubPlan') AS nonpattern_or,
+      (q.pred ~ '(~~[*]|~~|~[*])[[:space:]]*ANY[[:space:]]*\(') AS any_form
     FROM sg_nodes n
     CROSS JOIN LATERAL (
       SELECT coalesce(n.node ->> 'Alias', n.node ->> 'Relation Name') AS als,
@@ -170,9 +181,9 @@ FROM (
     WHERE n.node ? 'Relation Name'
       AND al.rawpred ~ '(~~[*]|~~|~[*])'
   ) y
-  WHERE y.colname IS NOT NULL
-  ORDER BY y.schemaname, y.relname, y.colname, y.queryid
+  WHERE y.patcols IS NOT NULL
+  ORDER BY y.schemaname, y.relname, y.patcols, y.queryid
 ) z
-GROUP BY z.schemaname, z.relname, z.colname;
+GROUP BY z.schemaname, z.relname, z.patcols;
 COLLECT_SQL
 }

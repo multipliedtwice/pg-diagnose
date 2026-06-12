@@ -169,6 +169,8 @@ JOIN LATERAL (
   WHERE i.indrelid = c.oid
     AND i.indisvalid
     AND i.indkey::smallint[] @> ARRAY[a.attnum]
+    AND (i.indpred IS NULL
+         OR pg_temp.conjunct_set(pg_get_expr(i.indpred, i.indrelid)) <@ pg_temp.conjunct_set(x.pred))
   ORDER BY coalesce(ui.idx_scan, 0) DESC
   LIMIT 1
 ) g ON TRUE
@@ -180,42 +182,67 @@ WHERE (ty.typcategory = 'A' OR ty.typname = 'jsonb')
 INSERT INTO sugg
 SELECT
   'MEDIUM',
-  CASE WHEN position(' OR ' in x.pred) > 0 THEN 'LOW' ELSE 'MEDIUM' END,
+  CASE WHEN x.nonpattern_or THEN 'LOW' ELSE 'MEDIUM' END,
   'Missing trigram index (pattern-match filter)',
   x.top_queryid,
-  x.schemaname || '.' || x.relname || '.' || x.colname,
-  'CREATE INDEX CONCURRENTLY IF NOT EXISTS '
-    || quote_ident(pg_temp.idx_name(x.relname || '_' || x.colname || '_trgm_idx'))
-    || ' ON ' || quote_ident(x.schemaname) || '.' || quote_ident(x.relname)
-    || ' USING gin (' || quote_ident(x.colname) || ' gin_trgm_ops);',
-  CASE WHEN position(' OR ' in x.pred) > 0
-       THEN 'the pattern sits inside an OR — one index alone cannot serve it; Postgres can BitmapOr several trgm indexes, so consider the full set of pattern columns or restructure'
-       ELSE NULL END,
-  'queries=' || x.queries || ' queryids=[' || x.queryids || ']'
+  x.schemaname || '.' || x.relname || ' (' || x.cols_label || ')',
+  x.ddl,
+  CASE
+    WHEN x.nonpattern_or
+      THEN 'OR spans a non-pattern branch (subplan/equality) — a trigram index cannot serve that branch; Postgres can BitmapOr the per-column trigram indexes below for the pattern branches, but the non-pattern branch still needs its own access path, or split the branches with a UNION ALL rewrite'
+    WHEN x.or_present
+      THEN 'pattern columns are combined with OR — no single index serves all of them; create the full set below and Postgres will BitmapOr them, or rewrite as UNION ALL of per-column lookups'
+    WHEN x.any_form
+      THEN 'single column with ~~* ANY(array) — one trigram index serves every element via BitmapOr; ready to test'
+    ELSE NULL
+  END,
+  'columns=[' || array_to_string(x.patcols, ', ') || ']'
+    || ' indexable_now=[' || coalesce(x.idx_cols, '(none — already indexed or non-text)') || ']'
+    || ' or=' || x.or_present || ' nonpattern_or=' || x.nonpattern_or || ' any_array=' || x.any_form
+    || ' queries=' || x.queries || ' queryids=[' || x.queryids || ']'
     || ' combined_total_ms=' || x.total_ms || ' combined_calls=' || x.calls
     || ' predicate: ' || left(x.pred, 160),
   '$0 --deep-queryid=' || x.top_queryid,
   15
-FROM sg_like x
-JOIN pg_namespace ns ON ns.nspname = x.schemaname
-JOIN pg_class c ON c.relnamespace = ns.oid AND c.relname = x.relname
-JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = x.colname AND NOT a.attisdropped
-JOIN pg_type ty ON ty.oid = a.atttypid AND ty.typcategory = 'S'
-WHERE EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')
-  AND pg_relation_size(c.oid) > 10 * 1024 * 1024
-  AND x.total_ms / greatest(x.calls, 1) > 500
-  AND NOT EXISTS (
-    SELECT 1
-    FROM pg_index i
-    JOIN pg_class ic ON ic.oid = i.indexrelid
-    JOIN pg_am am ON am.oid = ic.relam AND am.amname IN ('gin', 'gist')
-    WHERE i.indrelid = c.oid
-      AND i.indisvalid
-      AND array_position(i.indkey::smallint[], a.attnum) IS NOT NULL
-      AND (SELECT oc.opcname FROM pg_opclass oc
-           WHERE oc.oid = (i.indclass::oid[])[array_position(i.indkey::smallint[], a.attnum)])
-          IN ('gin_trgm_ops', 'gist_trgm_ops')
-  );
+FROM (
+  SELECT
+    l.schemaname, l.relname, l.patcols, l.queries, l.total_ms, l.calls,
+    l.top_queryid, l.queryids, l.pred, l.or_present, l.nonpattern_or, l.any_form,
+    string_agg(d.ddl, chr(10) ORDER BY l_unnest.col) AS ddl,
+    string_agg(d.col, ', ' ORDER BY l_unnest.col) AS idx_cols,
+    string_agg(quote_ident(l_unnest.col), ', ' ORDER BY l_unnest.col) AS cols_label
+  FROM sg_like l
+  CROSS JOIN LATERAL unnest(l.patcols) AS l_unnest(col)
+  LEFT JOIN LATERAL (
+    SELECT l_unnest.col AS col,
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS '
+        || quote_ident(pg_temp.idx_name(l.relname || '_' || l_unnest.col || '_trgm_idx'))
+        || ' ON ' || quote_ident(l.schemaname) || '.' || quote_ident(l.relname)
+        || ' USING gin (' || quote_ident(l_unnest.col) || ' gin_trgm_ops);' AS ddl
+    FROM pg_namespace ns
+    JOIN pg_class c ON c.relnamespace = ns.oid AND c.relname = l.relname
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = l_unnest.col AND NOT a.attisdropped
+    JOIN pg_type ty ON ty.oid = a.atttypid AND ty.typcategory = 'S'
+    WHERE ns.nspname = l.schemaname
+      AND pg_relation_size(c.oid) > 10 * 1024 * 1024
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_am am ON am.oid = ic.relam AND am.amname IN ('gin', 'gist')
+        WHERE i.indrelid = c.oid
+          AND i.indisvalid
+          AND array_position(i.indkey::smallint[], a.attnum) IS NOT NULL
+          AND (SELECT oc.opcname FROM pg_opclass oc
+               WHERE oc.oid = (i.indclass::oid[])[array_position(i.indkey::smallint[], a.attnum)])
+              IN ('gin_trgm_ops', 'gist_trgm_ops')
+      )
+  ) d ON TRUE
+  WHERE EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')
+    AND l.total_ms / greatest(l.calls, 1) > 500
+  GROUP BY l.schemaname, l.relname, l.patcols, l.queries, l.total_ms, l.calls,
+           l.top_queryid, l.queryids, l.pred, l.or_present, l.nonpattern_or, l.any_form
+) x
+WHERE x.ddl IS NOT NULL;
 
 \echo '-- rule:plan-runtime-mismatch'
 INSERT INTO sugg
@@ -287,20 +314,26 @@ SELECT
     || ')'
     || CASE WHEN raw.param_free THEN ' WHERE ' || raw.pred_clean ELSE '' END
     || ';' END,
-  CASE WHEN srv.idxname IS NOT NULL
-       THEN 'existing index ' || srv.idxname || ' (idx_scan=' || srv.scans
-         || ') already provides this order for this predicate — investigate why the plan sorts instead'
-       WHEN NOT raw.param_free AND fl.has_or
-       THEN 'predicate contains OR — equality-prefix shapes do not apply; consider a UNION rewrite or per-branch partial indexes'
-       WHEN NOT raw.param_free AND ec.eq_cols IS NOT NULL
-       THEN 'parameterized predicate — the DDL is a SHAPE (equality/IS NULL columns first, then the sort column), not ready-to-run SQL; confirm the equality set matches all callers'
-       WHEN NOT raw.param_free
-       THEN 'parameterized predicate with no equality columns detected — suggested index is unpartial and may be large; verify first'
-       ELSE NULL END,
+  nullif(concat_ws(' | ',
+    CASE WHEN srv.idxname IS NOT NULL
+         THEN 'existing index ' || srv.idxname || ' (idx_scan=' || srv.scans
+           || ') already provides this order for this predicate — investigate why the plan sorts instead'
+         WHEN NOT raw.param_free AND fl.has_or
+         THEN 'predicate contains OR — equality-prefix shapes do not apply; consider a UNION rewrite or per-branch partial indexes'
+         WHEN NOT raw.param_free AND ec.eq_cols IS NOT NULL
+         THEN 'parameterized predicate — the DDL is a SHAPE (equality/IS NULL columns first, then the sort column), not ready-to-run SQL; confirm the equality set matches all callers'
+         WHEN NOT raw.param_free
+         THEN 'parameterized predicate with no equality columns detected — suggested index is unpartial and may be large; verify first'
+         ELSE NULL END,
+    CASE WHEN raw.has_offset
+         THEN 'statement uses OFFSET — an ordered index bounds the sort but OFFSET stays O(offset); switch to keyset pagination (WHERE (sortcol, pk) < (last_sortval, last_pk) ORDER BY sortcol, pk LIMIT n) for the durable fix'
+         ELSE NULL END
+  ), '') AS detail,
   'queryid=' || raw.queryid || ' calls=' || raw.calls || ' total_ms=' || raw.total_exec_time::int
     || ' workload_share=' || round((100.0 * raw.total_exec_time / NULLIF(w.total_ms, 0))::numeric, 1) || '%'
     || ' mean_ms=' || raw.mean_exec_time::int || ' sort_key=' || raw.sk0
     || coalesce(' eq_cols=' || ec.eq_cols, '')
+    || ' offset=' || raw.has_offset
     || ' scan_predicate: ' || left(raw.pred_clean, 160),
   '$0 --deep-queryid=' || raw.queryid,
   20
@@ -348,6 +381,7 @@ FROM (
     coalesce((sk.m)[2], 'ASC') AS dir,
     (sk.m)[3] AS nulls_opt,
     (sc.full_pred !~ '[\$][0-9]') AS param_free,
+    (t.query ~* '\moffset\M') AS has_offset,
     regexp_replace(
       regexp_replace(sc.full_pred, '"' || sc.als || '"\.', '', 'g'),
       '\m' || sc.als || '\.', '', 'g'

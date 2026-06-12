@@ -103,7 +103,7 @@ FROM (
   CROSS JOIN LATERAL (
     SELECT coalesce(
       (SELECT sd.stats_reset FROM pg_stat_database sd WHERE sd.datname = current_database()),
-      (SELECT min(io.stats_reset) FROM pg_stat_io),
+      (SELECT min(io.stats_reset) FROM pg_stat_io io),
       now()) AS floor_ts
   ) sf
   WHERE s.idx_scan = 0
