@@ -1,0 +1,17 @@
+lib/common.sh
+lib/args.sh
+lib/detect.sh
+helpers/banner.sh
+helpers/explain.sh
+helpers/deep.sh
+helpers/suggestions.sh
+phases/config.sh
+phases/snapshot.sh
+phases/window.sh
+phases/progress.sh
+phases/history.sh
+phases/io.sh
+phases/tables.sh
+phases/indexes.sh
+phases/triggers.sh
+main.sh
