@@ -19,7 +19,7 @@ DDL and never modifies data.
 Fetch a pinned release asset once, then run it as often as you like:
 
     curl -sSL -o pg-diagnose.sh \
-      https://github.com/multipliedtwice/pg-diagnose/releases/download/v0.1.0/pg-diagnose.sh
+      https://github.com/multipliedtwice/pg-diagnose/releases/latest/download/pg-diagnose.sh
     chmod +x pg-diagnose.sh
 
     DATABASE_URL='postgresql://user:pass@host:port/db?sslmode=require' \
