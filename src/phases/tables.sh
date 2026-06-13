@@ -100,7 +100,7 @@ phase_tables() {
   WHERE datname = current_database();
   "
 
-  run_section "heavy seq scans (selectivity-aware; full_scan_pct near 100 = index candidate)" "
+  run_section "heavy seq scans (ranked by cumulative rows read, not table size — a small hot table is an index candidate too; full_scan_pct near 100 = index candidate)" "
   SELECT
     schemaname || '.' || relname  AS table,
     seq_scan,
@@ -114,8 +114,8 @@ phase_tables() {
     n_live_tup,
     pg_size_pretty(pg_relation_size(relid)) AS size
   FROM pg_stat_user_tables
-  WHERE seq_scan > 0 AND n_live_tup > 50000
+  WHERE seq_scan > 0 AND seq_tup_read > 500000
   ORDER BY seq_tup_read DESC
-  LIMIT 10;
+  LIMIT 15;
   "
 }
