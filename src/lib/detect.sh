@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 
 detect_capabilities() {
-  if ! psql_run -At -c "SELECT 1;" >/dev/null 2>&1; then
-    echo "could not connect to the database — check DATABASE_URL (host, port, user, password, sslmode)" >&2
+  local conn_err
+  if ! conn_err="$(psql_run -At -c "SELECT 1;" 2>&1)"; then
+    echo "could not connect to the database — psql said:" >&2
+    printf '%s\n' "$conn_err" | sed 's/^/  /' >&2
+    echo >&2
     echo "expected form: postgresql://user:pass@host:port/db?sslmode=require" >&2
     exit 1
   fi
