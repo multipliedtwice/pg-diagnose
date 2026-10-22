@@ -19,14 +19,14 @@ DDL and never modifies data.
 Fetch a pinned release asset once, then run it as often as you like:
 
     curl -sSL -o pg-diagnose.sh \
-      https://github.com/multipliedtwice/pg-diagnose/releases/latest/download/pg-diagnose.sh
+      https://github.com/multipliedtwice/pg-diagnose/releases/download/v0.1.11/pg-diagnose.sh
     chmod +x pg-diagnose.sh
 
     DATABASE_URL='postgresql://user:pass@host:port/db?sslmode=require' \
     DB_CLUSTER_ID='<cluster-id>' \
       ./pg-diagnose.sh
 
-Pin to a release tag (`v0.1.0`), not a branch, so a push never changes what
+Pin to the release tag in the download URL (`v0.1.11`), not a branch, so a push never changes what
 runs against your database.
 
 ## Usage
